@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import os
@@ -140,8 +141,12 @@ def test_shared_cli_defaults_reach_robot_config_parser(
     assert args.planner == "api"
     assert args.model is None
     assert args.max_turns == 100
-    assert args.max_tokens == 8192
+    assert args.max_tokens == 32768
     assert args.reasoning_effort == "high"
+    assert args.no_thinking is False
+    assert args.sequential_tools is False
+    assert args.context_window == 262144
+    assert args.compaction_fraction == 0.7
     assert args.dashboard is False
     assert args.dashboard_host == "127.0.0.1"
     assert args.dashboard_port == 0
@@ -521,6 +526,9 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
             self.calls: list[tuple[str, dict[str, Any]]] = []
             self.closed = False
             self.memory = FakeMemoryManager()
+
+        def initial_observation(self) -> None:
+            return None
 
         def execute_tool(self, name: str, args: dict[str, Any]) -> ToolResult:
             self.calls.append((name, args))
@@ -933,3 +941,25 @@ def test_invalid_memory_source_fails_before_startup(
         cli.main()
     assert exc.value.code == 2
     assert message in capsys.readouterr().err
+
+
+def test_api_planner_options_follow_flags_and_robot_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _cli_module()
+    monkeypatch.setattr(
+        cli, "get_robot_spec", lambda name: SimpleNamespace(sequential_tools=True)
+    )
+    args = argparse.Namespace(
+        robot_name="libero_rl",
+        no_thinking=True,
+        sequential_tools=False,
+        context_window=4096,
+        compaction_fraction=0.5,
+    )
+    assert cli._api_planner_options(args) == {
+        "thinking": False,
+        "sequential_tools": True,
+        "context_window": 4096,
+        "compaction_fraction": 0.5,
+    }

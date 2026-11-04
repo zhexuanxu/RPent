@@ -33,11 +33,15 @@ EXPECTED_ROBOTS = (
     "dual_franka",
     "franka",
     "libero",
+    "libero_rl",
     "robocasa",
     "robodojo",
     "robotwin",
     "yam",
 )
+
+# libero_rl runs fixed non-interactive rollouts without Dashboard control.
+DASHBOARD_ROBOTS = tuple(name for name in EXPECTED_ROBOTS if name != "libero_rl")
 
 PROMPT_VARIABLES = {
     "yam": {
@@ -62,6 +66,7 @@ PROMPT_VARIABLES = {
         "session_max": 1,
         "output_dir": Path("/output"),
     },
+    "libero_rl": {"observation_mode": "adaptive", "output_dir": Path("/output")},
     "robocasa": {
         "task_name": "OpenDrawer",
         "split": "target",
@@ -192,7 +197,7 @@ def test_libero_prompts_observe_task_before_reading_memory(
     )
 
 
-@pytest.mark.parametrize("robot_name", EXPECTED_ROBOTS)
+@pytest.mark.parametrize("robot_name", DASHBOARD_ROBOTS)
 def test_dashboard_metadata_has_consistent_fields_and_runtime_components(
     robot_name: str,
 ) -> None:

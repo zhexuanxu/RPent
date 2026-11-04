@@ -43,6 +43,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from rpent.cli.tui import (
     start_first_prompt_resolver,
@@ -155,7 +156,34 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument("--max-turns", type=int, default=100)
-    ap.add_argument("--max-tokens", type=int, default=8192)
+    ap.add_argument("--max-tokens", type=int, default=32768)
+    ap.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help="Ask a Qwen endpoint to answer without a reasoning block (api "
+        "planner). Thinking is on by default; --reasoning-effort selects a "
+        "tier on models that have them.",
+    )
+    ap.add_argument(
+        "--sequential-tools",
+        action="store_true",
+        help="Run physical tools one at a time and request one tool call per "
+        "turn (api planner). Robots whose tools share one arm force this.",
+    )
+    ap.add_argument(
+        "--context-window",
+        type=int,
+        default=262144,
+        help="Context length of the served model in tokens, which sizes the "
+        "api planner's history compaction.",
+    )
+    ap.add_argument(
+        "--compaction-fraction",
+        type=float,
+        default=0.7,
+        help="Fraction of --context-window at which the api planner compacts "
+        "its history.",
+    )
     ap.add_argument(
         "--reasoning-effort",
         choices=REASONING_EFFORTS,
@@ -172,6 +200,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         "Use for text-only models that reject image input "
         "(e.g. 400 \"message type 'image_url' is not supported\"); "
         "read_image then returns the image name instead, with a notice.",
+    )
+    ap.add_argument(
+        "--no-strict-tools",
+        action="store_true",
+        help="Omit strict tool definitions from OpenAI-family requests. Use for "
+        "servers such as SGLang that constrain decoding of the whole tool set "
+        "once any tool is strict, which corrupts tool call arguments. "
+        "Arguments are still validated locally.",
     )
     ap.add_argument(
         "--planner-timeout-s",
@@ -262,6 +298,18 @@ def _build_argparser() -> argparse.ArgumentParser:
     return ap
 
 
+def _api_planner_options(args: argparse.Namespace) -> dict[str, Any]:
+    """Options the CLI adds for the api planner; other planners ignore them."""
+    spec = get_robot_spec(args.robot_name)
+    return {
+        "thinking": not args.no_thinking,
+        "sequential_tools": args.sequential_tools
+        or getattr(spec, "sequential_tools", False),
+        "context_window": args.context_window,
+        "compaction_fraction": args.compaction_fraction,
+    }
+
+
 def _handoff_message(
     output_dir,
     session_number: int,
@@ -325,7 +373,9 @@ def _start_continuation_session(
         claude_code_max_budget_usd=args.claude_code_max_budget_usd,
         dashboard_events=dashboard_events,
         no_images=args.no_images,
+        strict_tool_definitions=not args.no_strict_tools,
         interactive=args.tui,
+        **_api_planner_options(args),
     )
     system_prompt = prompt_bundle.render(
         "system",
@@ -496,7 +546,9 @@ def main() -> int:
         claude_code_max_budget_usd=args.claude_code_max_budget_usd,
         dashboard_events=dashboard_events,
         no_images=args.no_images,
+        strict_tool_definitions=not args.no_strict_tools,
         interactive=args.tui,
+        **_api_planner_options(args),
     )
     prompt_bundle = robot_spec.prompts
     prompt_vars = {**prompt_vars, "output_dir": output_dir}

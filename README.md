@@ -113,6 +113,8 @@ RPent is built for four kinds of users:
 
 ## Quick Start
 
+For local Qwen-driven LIBERO collection without a VLA, see the [LIBERO RL installation, launchers and parameters](tools/libero_rl_eval/README.md).
+
 **1. Choose an environment and install RPent.**
 
 ```bash

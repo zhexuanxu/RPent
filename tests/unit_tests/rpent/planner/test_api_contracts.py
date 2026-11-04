@@ -91,6 +91,8 @@ def local_tools(monkeypatch):
     monkeypatch.setattr("rpent.tools.toolkit.substitute", lambda value: value)
     monkeypatch.setattr("rpent.planner.api_loop.substitute", lambda value: value)
     monkeypatch.setenv("PYDANTIC_AI_NO_BANNER", "1")
+    monkeypatch.delenv("RPENT_PRESENCE_PENALTY", raising=False)
+    monkeypatch.delenv("RPENT_REPETITION_PENALTY", raising=False)
 
 
 def tool(name, args=None, index=0):
@@ -115,6 +117,7 @@ def solve(tmp_path, model, toolkit=None, events=None, **kwargs):
             "compaction",
             "model_settings",
             "sequential_tools",
+            "thinking",
         )
         if key in kwargs
     }
@@ -271,6 +274,70 @@ def test_persistent_finish_refusal_stops_at_request_budget(tmp_path):
     assert result.error is None
     assert result.stats["turns_used"] == 3
     assert len(toolkit.calls) == 3
+
+
+def test_opening_message_appends_the_initial_observation(tmp_path):
+    """The first request carries the measured state, not just the task line."""
+    histories = []
+
+    async def stream(messages, info):
+        histories.append(copy.deepcopy(messages))
+        yield finish()
+
+    class ObservingToolkit(RobotToolkit):
+        def initial_observation(self):
+            return ToolResult(
+                data={"task": "put the cube in the bowl", "state": {"step": 0}},
+                images=[b"opening-image"],
+            )
+
+    result, _, _ = solve(
+        tmp_path,
+        FunctionModel(stream_function=stream),
+        toolkit=ObservingToolkit(Events()),
+        compaction=None,
+    )
+
+    assert result.error is None
+    opening = next(
+        part for part in histories[0][0].parts if isinstance(part, UserPromptPart)
+    )
+    text = opening.content if isinstance(opening.content, str) else opening.content[0]
+    assert "Do the task." in text
+    assert "put the cube in the bowl" in text
+    assert '"step": 0' in text
+    images = [part for part in opening.content if isinstance(part, BinaryContent)]
+    assert len(images) == 1
+    assert images[0].data == b"opening-image"
+
+
+def test_opening_message_drops_images_when_the_run_suppresses_them(tmp_path):
+    """``no_images`` keeps the text observation and never attaches the bytes."""
+    histories = []
+
+    async def stream(messages, info):
+        histories.append(copy.deepcopy(messages))
+        yield finish()
+
+    class ObservingToolkit(RobotToolkit):
+        def initial_observation(self):
+            return ToolResult(data={"task": "t"}, images=[b"secret"])
+
+    result, _, _ = solve(
+        tmp_path,
+        FunctionModel(stream_function=stream),
+        toolkit=ObservingToolkit(Events()),
+        compaction=None,
+        no_images=True,
+    )
+
+    assert result.error is None
+    opening = next(
+        part for part in histories[0][0].parts if isinstance(part, UserPromptPart)
+    )
+    content = [opening.content] if isinstance(opening.content, str) else opening.content
+    assert not [part for part in content if isinstance(part, BinaryContent)]
+    assert "Image omitted" in "".join(str(part) for part in content)
 
 
 def test_anthropic_request_retains_all_prompt_cache_controls(tmp_path, monkeypatch):
@@ -1074,7 +1141,9 @@ def test_factory_passes_interactive_mode(tmp_path, monkeypatch):
     from rpent.planner.base import Planner, build_planner
 
     model = TestModel(call_tools=[], custom_output_args=FINISH_ARGS)
-    monkeypatch.setattr("rpent.planner.base.build_api_model", lambda *args: model)
+    monkeypatch.setattr(
+        "rpent.planner.base.build_api_model", lambda *args, **kwargs: model
+    )
     planner = build_planner(
         "api",
         output_dir=tmp_path,
@@ -1152,41 +1221,40 @@ def test_offline_http_planner_preserves_non_streaming_responses():
         server.assert_complete()
 
 
-@pytest.mark.parametrize("effort", ["none", "high"])
-def test_reasoning_effort_reaches_openai_chat_request_body(tmp_path, effort):
-    """Serialize ``--reasoning-effort`` into the outgoing Chat Completions body."""
-    import httpx
-    from openai import AsyncOpenAI
-    from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import OpenAIProvider
+def _tool_call_message(name, arguments):
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": f"call_{name}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)},
+            }
+        ],
+    }
 
-    bodies = []
+
+def _openai_stub(bodies, replies=None):
+    """An OpenAI chat endpoint that records request bodies and answers in turn.
+
+    ``replies`` lists the assistant messages to return, one per request; the
+    last one repeats. By default every request is answered with a ``finish``
+    call. Streaming requests get the same message as one event.
+    """
+    import httpx
+
+    replies = list(replies or [_tool_call_message("finish", FINISH_ARGS)])
 
     def completion_for(body):
+        message = replies.pop(0) if len(replies) > 1 else replies[0]
         return {
             "id": "chatcmpl-272",
             "object": "chat.completion",
             "created": 0,
             "model": body.get("model", "deepseek-v4.1-flash"),
             "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_272",
-                                "type": "function",
-                                "function": {
-                                    "name": "finish",
-                                    "arguments": json.dumps(FINISH_ARGS),
-                                },
-                            }
-                        ],
-                    },
-                    "finish_reason": "tool_calls",
-                }
+                {"index": 0, "message": message, "finish_reason": "tool_calls"}
             ],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }
@@ -1228,14 +1296,28 @@ def test_reasoning_effort_reaches_openai_chat_request_body(tmp_path, effort):
             )
         return httpx.Response(200, json=completion)
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
-    sdk = AsyncOpenAI(
+    return httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+
+def _stub_sdk(bodies, replies=None, base_url="https://api.deepseek.com/v1"):
+    from openai import AsyncOpenAI
+
+    return AsyncOpenAI(
         api_key="offline-only",
-        base_url="https://api.deepseek.com/v1",
-        http_client=client,
+        base_url=base_url,
+        http_client=_openai_stub(bodies, replies),
     )
+
+
+@pytest.mark.parametrize("effort", ["none", "high"])
+def test_reasoning_effort_reaches_openai_chat_request_body(tmp_path, effort):
+    """Serialize ``--reasoning-effort`` into the outgoing Chat Completions body."""
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    bodies = []
     model = OpenAIChatModel(
-        "deepseek-v4.1-flash", provider=OpenAIProvider(openai_client=sdk)
+        "deepseek-v4.1-flash", provider=OpenAIProvider(openai_client=_stub_sdk(bodies))
     )
     assert model.profile.get("supports_thinking") is not True
 
@@ -1281,3 +1363,183 @@ def test_api_executes_readonly_calls_concurrently(tmp_path):
     assert sorted(completed) == ["left", "right"]
     assert result.finish_result == {"_finish": True, **FINISH_ARGS}
     assert result.stats["tool_calls"] == 3
+
+
+def _qwen_model(bodies, name="qwen3.5-4b", replies=None):
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    from rpent.planner.qwen import QwenChatModel
+
+    return QwenChatModel(
+        name,
+        provider=OpenAIProvider(
+            openai_client=_stub_sdk(bodies, replies, base_url="http://127.0.0.1:1/v1")
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("effort", "thinking", "expected_effort"),
+    [("none", True, None), ("xhigh", True, "xhigh"), ("none", False, None)],
+)
+def test_qwen_requests_state_thinking_and_sampling_explicitly(
+    tmp_path, effort, thinking, expected_effort
+):
+    """A Qwen endpoint never sees ``reasoning_effort: none``; thinking is stated."""
+    bodies = []
+    result, toolkit, _ = solve(
+        tmp_path,
+        _qwen_model(bodies),
+        reasoning_effort=effort,
+        thinking=thinking,
+        sequential_tools=True,
+        max_tokens=32768,
+        max_turns=2,
+    )
+    assert result.error is None
+    assert toolkit.calls == [("finish", FINISH_ARGS)]
+    body = bodies[0]
+    assert body["chat_template_kwargs"] == {
+        "enable_thinking": thinking,
+        "preserve_thinking": True,
+    }
+    assert (body["temperature"], body["top_p"], body["top_k"]) == (1.0, 0.95, 20)
+    assert body["max_completion_tokens"] == 32768
+    assert body["parallel_tool_calls"] is False
+    assert body.get("reasoning_effort") == expected_effort
+
+
+@pytest.mark.parametrize("qwen", [True, False])
+def test_qwen_tool_images_are_framed_as_a_tool_response(tmp_path, qwen):
+    """Images a tool returns stay inside the Qwen3.5 tool loop.
+
+    pydantic-ai sends them as a trailing user message; the Qwen3.5 template
+    takes any user message not framed by ``<tool_response>`` tags for a new
+    query and drops the reasoning of every earlier turn.
+    """
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    bodies = []
+    replies = [
+        _tool_call_message("observe", {}),
+        _tool_call_message("finish", FINISH_ARGS),
+    ]
+    if qwen:
+        model = _qwen_model(bodies, replies=replies)
+    else:
+        model = OpenAIChatModel(
+            "deepseek-v4.1-flash",
+            provider=OpenAIProvider(openai_client=_stub_sdk(bodies, replies)),
+        )
+    result, toolkit, _ = solve(tmp_path, model, max_turns=3)
+    assert result.error is None
+    assert [name for name, _ in toolkit.calls] == ["observe", "finish"]
+
+    messages = bodies[1]["messages"]
+    assert [m["role"] for m in messages[-3:]] == ["assistant", "tool", "user"]
+    content = messages[-1]["content"]
+    kinds = [part["type"] for part in content]
+    assert "image_url" in kinds
+    framed = content[0]["text"].startswith("<tool_response>") and content[-1][
+        "text"
+    ].endswith("</tool_response>")
+    assert framed is qwen
+
+
+@pytest.mark.parametrize("overrides", [False, True])
+def test_qwen_penalties_reach_every_http_request(tmp_path, monkeypatch, overrides):
+    """Scoped penalties survive SDK serialization without changing other sampling."""
+    if overrides:
+        monkeypatch.setenv("RPENT_PRESENCE_PENALTY", "1.5")
+        monkeypatch.setenv("RPENT_REPETITION_PENALTY", "1.0")
+    bodies = []
+    replies = [
+        _tool_call_message("observe", {}),
+        _tool_call_message("finish", FINISH_ARGS),
+    ]
+    result, toolkit, _ = solve(
+        tmp_path,
+        _qwen_model(bodies, replies=replies),
+        no_images=True,
+        sequential_tools=True,
+        max_tokens=32768,
+        max_turns=3,
+    )
+    assert result.error is None
+    assert [name for name, _ in toolkit.calls] == ["observe", "finish"]
+    assert len(bodies) == 2
+    for body in bodies:
+        if overrides:
+            assert body["presence_penalty"] == 1.5
+            assert body["repetition_penalty"] == 1.0
+        else:
+            assert "presence_penalty" not in body
+            assert "repetition_penalty" not in body
+        assert (body["temperature"], body["top_p"], body["top_k"]) == (1.0, 0.95, 20)
+        assert body["max_completion_tokens"] == 32768
+        assert body["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+        }
+        assert "reasoning_effort" not in body
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("RPENT_PRESENCE_PENALTY", "nan"),
+        ("RPENT_PRESENCE_PENALTY", "2.1"),
+        ("RPENT_REPETITION_PENALTY", "0"),
+        ("RPENT_REPETITION_PENALTY", "inf"),
+    ],
+)
+def test_qwen_rejects_invalid_penalties(monkeypatch, variable, value):
+    from rpent.planner.qwen import qwen_model_settings
+
+    monkeypatch.setenv(variable, value)
+    with pytest.raises(ValueError, match=variable):
+        qwen_model_settings(max_tokens=32768)
+
+
+def test_build_api_model_serves_qwen_through_its_adapter(monkeypatch):
+    from pydantic_ai.models.openai import OpenAIChatModel
+
+    from rpent.planner.base import build_api_model
+    from rpent.planner.qwen import QwenChatModel
+
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-only")
+    qwen = build_api_model(
+        "openai-chat:qwen3.5-4b", "http://127.0.0.1:1/v1", strict_tool_definitions=False
+    )
+    assert isinstance(qwen, QwenChatModel)
+    assert qwen.profile.get("openai_supports_strict_tool_definition") is False
+    other = build_api_model("openai-chat:deepseek-v4.1-flash", "http://127.0.0.1:1/v1")
+    assert isinstance(other, OpenAIChatModel) and not isinstance(other, QwenChatModel)
+
+
+def test_factory_passes_thinking_and_compaction_options(tmp_path, monkeypatch):
+    from rpent.planner.base import build_planner
+
+    model = TestModel(call_tools=[], custom_output_args=FINISH_ARGS)
+    monkeypatch.setattr(
+        "rpent.planner.base.build_api_model", lambda *args, **kwargs: model
+    )
+    planner = build_planner(
+        "api",
+        output_dir=tmp_path,
+        recipe_tag="test",
+        robot_name="test",
+        model="test:test",
+        dashboard_events=Events(),
+        thinking=False,
+        sequential_tools=True,
+        context_window=1000,
+        compaction_fraction=0.5,
+    )
+    assert planner.thinking is False
+    assert planner.sequential_tools is True
+    compaction = planner.compaction()
+    assert compaction.context_window == 1000
+    assert compaction.max_fraction == 0.5
+    assert compaction.max_messages == 80

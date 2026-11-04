@@ -85,6 +85,7 @@ from rpent.utils.logging import get_logger
 from rpent.utils.templates import substitute
 
 logger = get_logger("api")
+_IMAGE_OMITTED = "[Image omitted: --no-images is enabled.]"
 
 
 class _InvalidToolArguments(ModelRetry):
@@ -112,13 +113,36 @@ def _default_compaction() -> SlidingWindowCompaction:
     return SlidingWindowCompaction(max_messages=80, max_fraction=0.8, keep_messages=40)
 
 
+def sliding_window_compaction(
+    *, context_window: int | None = None, max_fraction: float = 0.8
+) -> Callable[[], SlidingWindowCompaction]:
+    """Return the default message window sized for a known model context.
+
+    Without ``context_window`` the Harness falls back to its own default window
+    for a model it does not know, so a self-hosted model compacts at the wrong
+    point unless the served context is named here.
+    """
+
+    def build() -> SlidingWindowCompaction:
+        return SlidingWindowCompaction(
+            max_messages=80,
+            max_fraction=max_fraction,
+            keep_messages=40,
+            context_window=context_window,
+        )
+
+    return build
+
+
 class ApiAgentLoop(Planner):
     """Implement ``Planner`` with a native Agent and reusable Harness capabilities.
 
     ``compaction`` builds each run's history compaction, and ``None`` disables
     compaction; ``model_settings`` replaces the settings derived from
-    ``max_tokens`` and ``reasoning_effort``; ``sequential_tools`` runs physical
-    tools one at a time. Defaults preserve ordinary runs.
+    ``max_tokens``, ``reasoning_effort`` and ``thinking``; ``sequential_tools``
+    runs physical tools one at a time. ``thinking`` keeps a Qwen model's
+    reasoning on when no effort tier is requested; other models read it only
+    through the ``Thinking`` capability. Defaults preserve ordinary runs.
     """
 
     def __init__(
@@ -134,6 +158,7 @@ class ApiAgentLoop(Planner):
         compaction: Callable[[], SlidingWindowCompaction] | None = _default_compaction,
         model_settings: ModelSettings | None = None,
         sequential_tools: bool = False,
+        thinking: bool = True,
     ) -> None:
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
@@ -143,6 +168,7 @@ class ApiAgentLoop(Planner):
         self.dashboard_events = dashboard_events
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
+        self.thinking = thinking
         self.no_images = no_images
         self.timeout_s = timeout_s
         self.interactive = interactive
@@ -173,6 +199,19 @@ class ApiAgentLoop(Planner):
             )
         )
 
+    def _thinking_level(self) -> bool | str:
+        """Thinking requested from the model: an effort tier, or on/off.
+
+        A Qwen endpoint keeps thinking on without a tier, which is how Qwen3.5
+        runs since its template has no effort tiers; elsewhere ``"none"`` keeps
+        its established meaning of thinking off.
+        """
+        from rpent.planner.qwen import QwenChatModel
+
+        if self.reasoning_effort != "none":
+            return self.reasoning_effort
+        return self.thinking if isinstance(self.model, QwenChatModel) else False
+
     async def solve_async(
         self,
         *,
@@ -198,12 +237,24 @@ class ApiAgentLoop(Planner):
             no_images=self.no_images,
             sequential_tools=self.sequential_tools,
         )
+        prompt = _opening_prompt(
+            user_message, toolkit.initial_observation(), no_images=self.no_images
+        )
         session = _Session(
             adapter,
             conversation_id,
             max_turns,
             interactive=self.interactive,
         )
+        trace = getattr(self.model, "request_trace", None)
+        session.request_trace = trace
+        compaction_factory = self.compaction
+        if trace is not None and compaction_factory is not None:
+            from functools import partial
+
+            from rpent.planner.request_trace import traced_compaction
+
+            compaction_factory = partial(traced_compaction, compaction_factory, trace)
         agent = Agent(
             self.model,
             name="rpent_api",
@@ -217,13 +268,15 @@ class ApiAgentLoop(Planner):
             model_settings=self.model_settings
             if self.model_settings is not None
             else _build_model_settings(
-                self.model, self.max_tokens, self.reasoning_effort
+                self.model,
+                self.max_tokens,
+                self.reasoning_effort,
+                thinking=self.thinking,
+                parallel_tool_calls=not self.sequential_tools,
             ),
             capabilities=[
-                *([self.compaction()] if self.compaction is not None else []),
-                Thinking(
-                    False if self.reasoning_effort == "none" else self.reasoning_effort
-                ),
+                *([compaction_factory()] if compaction_factory is not None else []),
+                Thinking(self._thinking_level()),
                 session,
             ],
         )
@@ -233,11 +286,11 @@ class ApiAgentLoop(Planner):
                 cancel_active_and_wait=adapter.cancel_active_and_wait,
                 resume_calls=toolkit.resume_calls,
                 emit_user=session.emit_user,
-                emit_initial_user=lambda: session.emit_user(user_message),
+                emit_initial_user=lambda: session.emit_user(_prompt_text(prompt)),
                 defer_message_ack=True,
                 submit_while_busy=True,
             )
-        run = asyncio.create_task(session.run(_ConversationAgent(agent), user_message))
+        run = asyncio.create_task(session.run(_ConversationAgent(agent), prompt))
         try:
             await asyncio.wait_for(
                 run,
@@ -276,14 +329,63 @@ class ApiAgentLoop(Planner):
         )
 
 
+def _opening_prompt(
+    user_message: str, observation: ToolResult | None, *, no_images: bool
+) -> str | list[UserContent]:
+    """Append a toolkit's initial observation to the opening user message.
+
+    The measured state belongs to the first request: without it the planner is
+    asked to act on a scene it has never seen, and text-only runs get no
+    observation at all. Images are dropped when the run suppresses them.
+    """
+    if observation is None:
+        return user_message
+    text = f"{user_message}\n\n{observation.to_text()}"
+    if not observation.images:
+        return text
+    return [
+        text,
+        *(
+            _IMAGE_OMITTED
+            if no_images
+            else BinaryContent(data=image, media_type="image/png")
+            for image in observation.images
+        ),
+    ]
+
+
+def _prompt_text(prompt: str | Sequence[UserContent]) -> str:
+    """Return the text of an opening prompt that may carry images."""
+    return prompt if isinstance(prompt, str) else str(prompt[0])
+
+
 def _build_model_settings(
-    model: Model, max_tokens: int, reasoning_effort: str | None = None
+    model: Model,
+    max_tokens: int,
+    reasoning_effort: str | None = None,
+    *,
+    thinking: bool = True,
+    parallel_tool_calls: bool = True,
 ) -> ModelSettings:
-    """Enable parallel tool requests and preserve Anthropic prompt caching."""
+    """Enable parallel tool requests and preserve Anthropic prompt caching.
+
+    A Qwen chat endpoint gets its sampling defaults and an explicit thinking
+    switch; ``parallel_tool_calls`` reaches only that path, other OpenAI-family
+    endpoints keep the established settings.
+    """
     from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
     from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
     from pydantic_ai.profiles.openai import OPENAI_REASONING_EFFORT_MAP
 
+    from rpent.planner.qwen import QwenChatModel, qwen_model_settings
+
+    if isinstance(model, QwenChatModel):
+        return qwen_model_settings(
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort or "none",
+            thinking=thinking,
+            parallel_tool_calls=parallel_tool_calls,
+        )
     if isinstance(model, AnthropicModel):
         return AnthropicModelSettings(
             max_tokens=max_tokens,
@@ -358,7 +460,9 @@ class _HarnessToolkit(FunctionToolset):
         self.stopping = threading.Event()
         self.validators: dict[str, Draft202012Validator] = {}
         self.output_types: list[Any] = [str]
-        self.add_tool(Tool(self.read_image, takes_ctx=True, sequential=True))
+        # A toolkit that exposes only its own tools opts out of read_image.
+        if getattr(toolkit, "planner_builtin_tools", True):
+            self.add_tool(Tool(self.read_image, takes_ctx=True, sequential=True))
         for declaration in toolkit.list_tools():
             spec = {
                 "name": declaration.name,
@@ -520,6 +624,8 @@ class _Session(AbstractCapability):
     native run only for a follow-up after completion or interruption.
     """
 
+    request_trace = None
+
     def __init__(
         self,
         toolkit: _HarnessToolkit,
@@ -647,6 +753,8 @@ class _Session(AbstractCapability):
         self, ctx: RunContext, *, node: AgentNode, result: NodeResult
     ) -> NodeResult:
         if isinstance(node, ModelRequestNode) and isinstance(result, CallToolsNode):
+            if self.request_trace is not None:
+                self.request_trace.response(result.model_response)
             # Retain completed turns even when request history is later compacted.
             content: list[dict[str, Any]] = []
             for part in result.model_response.parts:
@@ -733,12 +841,16 @@ class _Session(AbstractCapability):
         # Only submissions that never entered it need to be subtracted here.
         return discarded
 
-    async def run_cli(self, agent: _ConversationAgent, prompt: str) -> None:
+    async def run_cli(
+        self, agent: _ConversationAgent, prompt: str | Sequence[UserContent]
+    ) -> None:
         """Run the preset task, then hand its history to the native CLI."""
         from rich.console import Console
 
         console = Console()
-        console.print("Task context:\n" + prompt, markup=False, highlight=False)
+        console.print(
+            "Task context:\n" + _prompt_text(prompt), markup=False, highlight=False
+        )
         console.print(
             "Starting the task. You can enter follow-up instructions after it "
             "responds, or use /exit to close.",
@@ -757,14 +869,16 @@ class _Session(AbstractCapability):
             usage_limits=self.limits,
         )
 
-    async def run(self, agent: _ConversationAgent, prompt: str) -> None:
+    async def run(
+        self, agent: _ConversationAgent, prompt: str | Sequence[UserContent]
+    ) -> None:
         tasks: list[asyncio.Task] = []
         try:
             if self.interactive:
                 await self.run_cli(agent, prompt)
                 return
             if self.control is None:
-                self.emit_user(prompt)
+                self.emit_user(_prompt_text(prompt))
                 await self._run_conversation(agent, prompt)
                 return
             await self.control.start()
@@ -788,7 +902,9 @@ class _Session(AbstractCapability):
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_conversation(self, agent: _ConversationAgent, prompt: str) -> None:
+    async def _run_conversation(
+        self, agent: _ConversationAgent, prompt: str | Sequence[UserContent]
+    ) -> None:
         """Run the SDK, then wait for Dashboard follow-ups in the same conversation."""
         while True:
             self.cancellation = CancellationToken()

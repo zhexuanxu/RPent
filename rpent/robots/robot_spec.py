@@ -68,6 +68,9 @@ class RobotSpec:
     #: Physical scene restoration requires operator involvement, not simulator reset.
     #: Operator input requires an exclusive terminal unless an external ENV owns it.
     is_real_robot: bool = False
+    #: Run physical tools one at a time and ask the model for one tool call per
+    #: turn; a toolkit whose tools share one arm sets this.
+    sequential_tools: bool = False
     #: Whether the robot implements the exploration-time toolkit contract.
     #: The CLI uses this instead of hard-coding robot names so real-robot
     #: extensions can opt into exploration with their own reset semantics.

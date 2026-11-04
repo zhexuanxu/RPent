@@ -139,6 +139,10 @@ class Toolkit:
     :meth:`close` to release robot-side primitives / servers at the end of the run.
     """
 
+    #: Whether planners may add their own tools, such as Claude Code built-ins
+    #: and the API image reader, beside the registered declarations.
+    planner_builtin_tools = True
+
     def __init__(
         self,
         *,
@@ -328,6 +332,10 @@ class Toolkit:
     ) -> ToolResult:
         """Capture and return the observation produced by a stateful tool."""
         raise NotImplementedError
+
+    def initial_observation(self) -> ToolResult | None:
+        """Return an observation planners append to the opening user message."""
+        return None
 
     # ------------------------------------------------------------------
     # Server lifecycle hooks (overridden by robot toolkits)
