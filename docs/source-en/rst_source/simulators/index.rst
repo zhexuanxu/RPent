@@ -12,8 +12,8 @@ Choose a platform for installation and usage instructions.
      - Contents
    * - :doc:`libero`
      - Tabletop manipulation with LIBERO, LIBERO-PRO, and LIBERO-plus.
-   * - :doc:`libero_rl`
-     - The RL workflow on LIBERO-PRO: six end-effector tools, no action model, standalone evaluation of served Qwen models.
+   * - :doc:`rl`
+     - Shared adaptive multiturn and snapshot tools for LIBERO, RoboCasa and RoboTwin, without an action model.
    * - :doc:`robocasa`
      - Kitchen manipulation with RoboCasa365 and Target50 experiments.
    * - :doc:`robotwin`

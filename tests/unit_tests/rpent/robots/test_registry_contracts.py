@@ -33,15 +33,15 @@ EXPECTED_ROBOTS = (
     "dual_franka",
     "franka",
     "libero",
-    "libero_rl",
+    "rl",
     "robocasa",
     "robodojo",
     "robotwin",
     "yam",
 )
 
-# libero_rl runs fixed non-interactive rollouts without Dashboard control.
-DASHBOARD_ROBOTS = tuple(name for name in EXPECTED_ROBOTS if name != "libero_rl")
+# rl runs fixed non-interactive rollouts without Dashboard control.
+DASHBOARD_ROBOTS = tuple(name for name in EXPECTED_ROBOTS if name != "rl")
 
 PROMPT_VARIABLES = {
     "yam": {
@@ -66,7 +66,7 @@ PROMPT_VARIABLES = {
         "session_max": 1,
         "output_dir": Path("/output"),
     },
-    "libero_rl": {"observation_mode": "adaptive", "output_dir": Path("/output")},
+    "rl": {"observation_mode": "adaptive", "output_dir": Path("/output")},
     "robocasa": {
         "task_name": "OpenDrawer",
         "split": "target",

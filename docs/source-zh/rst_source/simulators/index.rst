@@ -12,8 +12,8 @@
      - 内容
    * - :doc:`libero`
      - 桌面操作；LIBERO、LIBERO-PRO 与 LIBERO-plus。
-   * - :doc:`libero_rl`
-     - LIBERO-PRO 上的强化学习工作流：六个末端执行器工具，没有动作模型，独立评估已部署的 Qwen 模型。
+   * - :doc:`rl`
+     - LIBERO、RoboCasa、RoboTwin 的共享 adaptive multiturn / snapshot 工具，无动作模型。
    * - :doc:`robocasa`
      - 厨房操作；RoboCasa365 与 Target50 实验。
    * - :doc:`robotwin`

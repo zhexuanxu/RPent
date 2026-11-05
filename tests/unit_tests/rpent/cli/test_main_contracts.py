@@ -28,6 +28,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 ROBOT_HELP_CASES = [
+    ("rl", ("--simulator", "--workflow", "--task-name")),
     ("libero", ("--suite", "--task", "--libero-type")),
     ("robocasa", ("--task-name", "--split", "--hi-res")),
     ("robotwin", ("--task-name", "--task-config", "--robotwin-assets-path")),
@@ -951,7 +952,7 @@ def test_api_planner_options_follow_flags_and_robot_spec(
         cli, "get_robot_spec", lambda name: SimpleNamespace(sequential_tools=True)
     )
     args = argparse.Namespace(
-        robot_name="libero_rl",
+        robot_name="rl",
         no_thinking=True,
         sequential_tools=False,
         context_window=4096,

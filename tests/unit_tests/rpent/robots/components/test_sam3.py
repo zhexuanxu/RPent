@@ -19,6 +19,7 @@ import binascii
 import threading
 from typing import Any
 
+import numpy as np
 import pytest
 
 from rpent.robots.components.sam3_server import Sam3Facade, Sam3Result
@@ -143,3 +144,37 @@ def test_sam3_result_to_dict_drops_none_fields() -> None:
         "found": True,
         "score": 0.5,
     }
+
+
+def test_query_group_keeps_multiple_instances_and_uses_one_image_state():
+    from types import SimpleNamespace
+
+    facade = _StubSam3()
+    states, prompts = [], []
+
+    def state(raw):
+        states.append(raw)
+        return {"frame": raw}
+
+    def query(*, prompt, state):
+        prompts.append((prompt, state))
+        masks = np.zeros((3, 1, 8, 8), dtype=bool)
+        masks[0, 0, :3, :3] = True
+        masks[1, 0, 4:, 4:] = True
+        masks[2, 0, :2, :2] = True
+        return {"masks": masks, "scores": np.array([0.8, 0.95, 0.1])}
+
+    facade._state_for_image = state
+    facade._processor = SimpleNamespace(set_text_prompt=query)
+    result = facade.segment_queries(_image_b64(), ["cube", "bowl"])
+    assert states == [b"image-bytes"]
+    assert [prompt for prompt, _ in prompts] == ["cube", "bowl"]
+    assert [len(group) for group in result] == [2, 2]
+    assert [item["score"] for item in result[0]] == [0.95, 0.8]
+    assert all(item["mask_shape"] == [8, 8] for group in result for item in group)
+
+
+@pytest.mark.parametrize("queries", [[], [""], ["   "], ["x"] * 9, [123]])
+def test_query_group_validates_before_inference(queries):
+    with pytest.raises(ValueError):
+        _StubSam3().segment_queries(_image_b64(), queries)

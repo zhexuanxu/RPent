@@ -550,6 +550,8 @@ def main() -> int:
         interactive=args.tui,
         **_api_planner_options(args),
     )
+    if robot_spec.configure_planner is not None:
+        planner = robot_spec.configure_planner(planner, run_config)
     prompt_bundle = robot_spec.prompts
     prompt_vars = {**prompt_vars, "output_dir": output_dir}
     system_prompt = prompt_bundle.render(

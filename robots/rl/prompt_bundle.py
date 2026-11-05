@@ -1,0 +1,109 @@
+# Copyright 2026 The RPent Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Interface contract prompts for LIBERO RL rollouts, in four levels of detail.
+
+``simple`` is the bare tool contract. The other variants add what the robot
+and its sensors are, in the order of the Astra prompt ablation: ``base``
+describes the arm, its frames, the execution of a motion and how to work;
+``base_gripper`` adds the finger geometry; ``base_gripper_camera`` adds the
+camera geometry. Numbers come from the LIBERO scene and the robosuite Panda
+gripper model, and describe this tool set only.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from pathlib import Path
+
+CONTRACT = """You control one LIBERO robot arm. Complete the given task using the available tools.
+Positions are absolute world-frame end-effector coordinates in meters.
+Angles are the yaw and pitch defined by move_to, in radians.
+Robot state values are measured, not commanded targets.
+Pixels are [row, col] and must match their camera and observation step.
+Segmentation geometry describes visible surfaces, not guaranteed grasp poses.
+Task success is determined by the environment; finish ends the episode.
+Tool names may carry an mcp__rpent__ prefix."""
+
+OBSERVATION_NOTE = "Images are supplied only when you call view_env."
+OBSERVATION_MODES = ("adaptive",)
+
+BASE = """Robot and frames
+- One Franka arm with a parallel-jaw gripper. Its base stands at the -x edge of the workspace and faces +x; +y is the robot's left and +z is up. The work surface is horizontal.
+- pose.xyz is the grasp point between the finger pads, in meters. pose.yaw is the heading of the gripper x-axis in the world xy-plane. pose.pitch tilts the approach axis within the world yz-plane; 0 points straight down. opening is the normalized jaw gap, 1 open and 0 closed, and finger_gap_m is that gap in meters.
+Execution
+- move_to servos toward one absolute target at 20 Hz, at most 0.03 m and 0.12 rad per control step, and returns once within 0.004 m and 0.02 rad, when progress stalls, or after 300 steps (15 s). Its reply is the measured outcome: reached, partial with a reason, or error. Omitted targets keep their measured values and the jaw target persists.
+- set_gripper drives the jaws toward an opening and reports the measured one; closing stops at contact, which is not proof of a grasp.
+- Motion is a straight line with no collision avoidance. Approach objects from above, keep the grasp point above surfaces and other objects, and move at most about 0.10 m per call.
+Method
+- Observe before acting and after every motion; the measured state and the latest observation step are the truth, never the command you sent.
+- A grasp cycle: hover above the object, align the yaw, descend, close, read the opening, lift, carry, lower, open, then retreat straight up before moving aside.
+- The environment judges success from object poses. After placing, release and retreat so the object settles; call finish once the task state is visibly complete."""
+
+GRIPPER = """Gripper geometry
+- The grasp point lies between the finger pads, 9.7 cm beyond the wrist flange along the approach axis. The pads reach about 1.2 cm above and 0.4 cm below it and the fingertips about 0.9 cm below it, so keep the grasp point at least 1.5 cm above the surface an object stands on.
+- The jaws slide along the gripper y-axis and close perpendicular to the yaw heading: at yaw 0 they close along world y. To grip an elongated object across its width, set target_yaw to its axis_yaw; yaw repeats every pi.
+- Fully open, the jaws span about 0.08 m (opening 1.0 is a gap of about 0.078 m); each pad is 16 mm wide and 16 mm tall. An object wider than 0.075 m along the closing axis cannot be grasped there.
+- Grasp near mid-height so the pads cover the object's sides: descend until the grasp point is 1 to 2 cm below top_z_m for low objects, and to mid-height for tall ones.
+- After closing, an opening of 0.03 or less (gap under 3 mm) means the jaws met nothing; a held object leaves an opening of roughly 0.08 to 0.6 (gap 6 to 50 mm) with status blocked. Reopen before retrying. The jaw target persists through later moves, so a held object stays held until set_gripper opens."""
+
+CAMERA = """Cameras
+- agentview is fixed on the far side of the workspace, looking back toward the robot and downward. The robot base appears near the top of its image; down the image is +x, toward the camera, and right is +y, the robot's left. Its focal length is about 1236 px for the 1024x1024 image (45 degree vertical field).
+- wrist rides with the gripper, 9.7 cm above the grasp point along the approach axis and 5 cm to its side, looking along that axis. Image-right is the jaw closing axis (gripper +y) and image-up the gripper x heading, so at yaw 0 image-right is world -y and image-up is world +x. Focal length about 667 px (75 degree field).
+- Pixels are [row, col] from the top-left corner. A pixel alone fixes only a ray; segment and back_project return the depth-measured world point of the visible surface, so world_xyz lies on the object's top or facing side rather than its center, and top_z_m is its highest visible point.
+- Use pixels, masks and poses from the same observation step, and take a new observation after every motion."""
+
+PROMPT_VARIANTS = ("simple", "base", "base_gripper", "base_gripper_camera")
+_SECTIONS = {
+    "simple": (),
+    "base": (BASE,),
+    "base_gripper": (BASE, GRIPPER),
+    "base_gripper_camera": (BASE, GRIPPER, CAMERA),
+}
+
+
+def system_prompt(variables: Mapping[str, object] | None = None) -> str:
+    """Return the adaptive tool contract and the selected prompt sections."""
+    variables = variables or {}
+    if variables.get("observation_mode", "adaptive") != "adaptive":
+        raise ValueError("rl supports only adaptive observations")
+    environment = str(variables.get("environment", "libero"))
+    workflow = str(variables.get("workflow", "multiturn"))
+    if environment not in ("libero", "robocasa", "robotwin") or workflow not in (
+        "multiturn",
+        "zap",
+    ):
+        raise ValueError("unsupported environment or workflow")
+    if environment != "libero" or workflow == "zap":
+        prompts = Path(__file__).parent / "prompts"
+        return "\n\n".join(
+            (prompts / name).read_text().strip()
+            for name in ("shared.md", f"{environment}.md", f"{workflow}.md")
+        )
+    if variables.get("observation_mode", "adaptive") != "adaptive":
+        raise ValueError("rl supports only adaptive observations")
+    variant = str(variables.get("prompt", "simple"))
+    if variant not in _SECTIONS:
+        raise ValueError(
+            f"unknown prompt variant {variant!r}; expected one of {PROMPT_VARIANTS}"
+        )
+    text = f"{CONTRACT}\n{OBSERVATION_NOTE}"
+    for section in _SECTIONS[variant]:
+        text += f"\n\n{section}"
+    return text
+
+
+def user_prompt(variables: Mapping[str, object] | None = None) -> str:
+    """Introduce the task and initial state that planners append."""
+    return "The task and the measured initial state follow."

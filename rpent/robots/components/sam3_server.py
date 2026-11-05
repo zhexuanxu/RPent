@@ -123,6 +123,67 @@ class Sam3Facade(RpcFacade):
     def _register_rpc(self) -> None:
         self._rpc["sam3.segment"] = self.segment
         self._readonly_methods.add("sam3.segment")
+        self._rpc["sam3.segment_queries"] = self.segment_queries
+        self._readonly_methods.add("sam3.segment_queries")
+
+    def segment_queries(
+        self, image_base64: str, queries: list[str], *, min_score: float = 0.2
+    ) -> list[list[dict[str, Any]]]:
+        """Segment text queries on one exact frame, retaining all scored instances.
+
+        The image lock covers the complete query group so another episode cannot
+        replace its features between queries. The existing top-one RPC is unchanged.
+        """
+        if not isinstance(queries, list) or not 1 <= len(queries) <= 8:
+            raise ValueError("queries must contain 1 to 8 object descriptions")
+        if any(
+            not isinstance(query, str) or not query.strip() or len(query) > 120
+            for query in queries
+        ):
+            raise ValueError("each query must contain 1 to 120 characters")
+        if not 0 <= min_score <= 1:
+            raise ValueError("min_score must be between 0 and 1")
+        raw = base64.b64decode(image_base64, validate=True)
+        if not raw:
+            raise ValueError("image_base64 is empty")
+        groups = []
+        with self._lock:
+            state = self._state_for_image(raw)
+            for query in queries:
+                with self._inference_context():
+                    output = self._processor.set_text_prompt(
+                        prompt=query.strip(), state=state
+                    )
+                masks, scores, boxes = (
+                    output.get(key) for key in ("masks", "scores", "boxes")
+                )
+                if masks is None or scores is None:
+                    groups.append([])
+                    continue
+
+                def array(value):
+                    return (
+                        value
+                        if isinstance(value, np.ndarray)
+                        else value.detach().float().cpu().numpy()
+                    )
+
+                masks, scores = array(masks), array(scores).reshape(-1)
+                boxes = None if boxes is None else array(boxes)
+                found = []
+                for index in np.argsort(-scores):
+                    if scores[index] < min_score:
+                        break
+                    result = self._select_top(
+                        masks=masks[index : index + 1],
+                        scores=scores[index : index + 1],
+                        boxes=None if boxes is None else boxes[index : index + 1],
+                        min_score=min_score,
+                    )
+                    if result.found:
+                        found.append(result.to_dict())
+                groups.append(found)
+        return groups
 
     def _segment_bytes(
         self,
