@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -518,3 +519,55 @@ def test_episode_planner_is_a_thinking_qwen_policy_client() -> None:
     assert settings["extra_body"]["top_k"] == 20
     assert settings["parallel_tool_calls"] is False
     assert "openai_reasoning_effort" not in settings
+
+
+def test_concurrent_runtime_clients_follow_their_servers_announced_ports(tmp_path):
+    script = tmp_path / "server.py"
+    script.write_text(
+        "import argparse\n"
+        "from rpent.utils.rpc import RpcFacade\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--identity', type=int)\n"
+        "args, _ = parser.parse_known_args()\n"
+        "facade = RpcFacade()\n"
+        "facade._rpc['identity'] = lambda: args.identity\n"
+        # The child selects its port, so the client must discover it.
+        "facade.serve(transport='http', host='127.0.0.1', port=0, parent_watch=True)\n"
+    )
+
+    def spawn(index):
+        output = tmp_path / str(index)
+        output.mkdir()
+        (output / "env.log").write_text("RPC server listening on http://127.0.0.1:1\n")
+        return robot_spec._spawn_server(
+            argparse.Namespace(cuda_device=None),
+            output,
+            "env",
+            script,
+            ["--identity", str(index)],
+        )
+
+    results, errors = [], []
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(spawn, index) for index in range(8)]
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except Exception as error:
+                    errors.append(error)
+        if errors:
+            raise errors[0]
+        assert [client.call("identity") for _, client in results] == list(range(8))
+    finally:
+        for daemon, _ in results:
+            daemon.stop(timeout=2)
+
+
+def test_runtime_reports_a_server_that_exits_before_announcing(tmp_path):
+    script = tmp_path / "crash.py"
+    script.write_text("raise SystemExit(7)\n")
+    with pytest.raises(RuntimeError, match="did not announce its endpoint"):
+        robot_spec._spawn_server(
+            argparse.Namespace(cuda_device=None), tmp_path, "env", script, []
+        )

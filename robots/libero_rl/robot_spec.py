@@ -37,9 +37,8 @@ from rpent.robots.prompt_bundle import PromptBundle
 from rpent.robots.robot_spec import RobotSpec, RunConfig
 from rpent.robots.runtime import try_spawn_server, try_wait_server
 from rpent.utils.config import get_memory_dir, get_repo_root
-from rpent.utils.daemon import ProcessDaemon, pick_free_port
-from rpent.utils.rpc import make_rpc_client
-from rpent.utils.rpc.http_rpc import HttpRpcClient
+from rpent.utils.daemon import ProcessDaemon
+from rpent.utils.rpc import make_rpc_client, wait_for_endpoint
 
 if TYPE_CHECKING:
     from rpent.utils.rpc import RpcClient
@@ -183,7 +182,8 @@ def _spawn_server(
     script_args: list[str],
     env_overrides: dict[str, str] | None = None,
 ) -> tuple[ProcessDaemon, RpcClient]:
-    host, port = "127.0.0.1", pick_free_port()
+    log = output_dir / f"{name}.log"
+    log.write_text("")
     cuda = (
         ["--cuda-device", str(args.cuda_device)] if args.cuda_device is not None else []
     )
@@ -196,17 +196,22 @@ def _spawn_server(
             "--transport",
             "http",
             "--host",
-            host,
+            "127.0.0.1",
             "--port",
-            str(port),
+            "0",
             "--parent-watch",
             *cuda,
         ],
         env_overrides=env_overrides,
-        log_path=str(output_dir / f"{name}.log"),
+        log_path=str(log),
     )
     daemon.start()
-    return daemon, HttpRpcClient(f"http://{host}:{port}")
+    try:
+        endpoint = wait_for_endpoint(daemon)
+    except BaseException:
+        daemon.stop()
+        raise
+    return daemon, make_rpc_client(endpoint)
 
 
 def _start_env(
@@ -284,7 +289,6 @@ def _init_runtime(
         raise ValueError(f"unknown libero_rl runtime components: {sorted(unknown)}")
 
     owned: dict[str, ProcessDaemon] = {}
-    # Start both services before waiting so their startup overlaps.
     pending = {
         name: try_spawn_server(
             owned, dashboard_events, name, partial(starter, args, output_dir)
