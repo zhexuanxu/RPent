@@ -113,7 +113,7 @@ RPent is built for four kinds of users:
 
 ## Quick Start
 
-For local Qwen-driven LIBERO collection without a VLA, see the [LIBERO RL installation, launchers and parameters](tools/libero_rl_eval/README.md).
+For adaptive VLM control without a VLA on LIBERO, RoboCasa or RoboTwin, see the [shared RL workflow installation, launchers and parameters](tools/rl/README.md). It also documents the experimental `--workflow zap` snapshot loop.
 
 **1. Choose an environment and install RPent.**
 
