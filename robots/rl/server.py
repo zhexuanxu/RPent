@@ -41,6 +41,23 @@ def planner_command_pose(planner, actual_base_pose, target_pose):
     return [*goal.p, *goal.q]
 
 
+def _release_unused_batch_planners(env):
+    """Keep the single-pose planners used by this workflow and release warmup caches."""
+    import gc
+
+    import torch
+
+    sub_env = env._sub_env(0)
+    with sub_env.lock:
+        robot = getattr(sub_env.task, "robot", None)
+        if robot is not None:
+            for arm in ("left", "right"):
+                planner = getattr(robot, f"{arm}_planner")
+                planner.motion_gen_batch = None
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def main() -> None:
     """Run one isolated simulator in its own Python environment."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -136,8 +153,14 @@ def main() -> None:
             args.assets_path,
             args.max_episode_steps,
         )
+        _release_unused_batch_planners(env)
 
         class CleanRoboTwinFacade(RoboTwinEnvFacade):
+            def reset(self):
+                result = super().reset()
+                _release_unused_batch_planners(self._env)
+                return result
+
             def plan_arm_path(self, arm, target_pose):
                 sub_env = self._env._sub_env(0)
                 with sub_env.lock:
