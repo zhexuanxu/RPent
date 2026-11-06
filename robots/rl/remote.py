@@ -1,0 +1,429 @@
+# Copyright 2026 The RPent Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Run the existing adaptive tools beside a simulator, across an RPC boundary."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import hashlib
+import json
+import os
+import sys
+import threading
+from pathlib import Path
+from typing import Any
+
+from rpent.session import EnvState
+from rpent.tools import ToolResult, iter_tools
+from rpent.tools.toolkit import Toolkit
+from rpent.utils.config import get_repo_root
+from rpent.utils.logging import get_logger
+from rpent.utils.rpc import RpcFacade, make_rpc_client
+
+logger = get_logger("rl_remote")
+
+
+def source_digest() -> str:
+    """Identify both ends of the control, tool and artifact protocol."""
+    root = get_repo_root()
+    digest = hashlib.sha256()
+    for folder in (
+        "robots/rl",
+        "robots/libero",
+        "robots/robocasa",
+        "robots/robotwin",
+        "rpent/tools",
+        "rpent/session",
+        "rpent/utils/rpc",
+    ):
+        for path in sorted((root / folder).rglob("*")):
+            if not path.is_file() or path.suffix not in {".py", ".md", ".yaml"}:
+                continue
+            digest.update(str(path.relative_to(root)).encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def declarations(toolkit: Toolkit) -> list[dict[str, Any]]:
+    """Describe the original tools without changing their model-facing schemas."""
+    return [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.input_schema,
+            "readonly": tool.readonly,
+        }
+        for tool in toolkit.list_tools()
+    ]
+
+
+class ArtifactExchange:
+    """Send changed original files with their byte hashes, without shared storage."""
+
+    def __init__(self, output: Path) -> None:
+        self.output = output
+        self._sent: dict[str, tuple[int, int]] = {}
+
+    def collect(self) -> list[dict[str, Any]]:
+        """Collect files named by the state manifest, publishing the manifest last."""
+        manifest_path = self.output / "states.json"
+        manifest = json.loads(manifest_path.read_text())
+        paths = [self.output / name for name in manifest["run_artifacts"]]
+        for row in manifest["steps"]:
+            for name in row["artifacts"]:
+                paths.append(
+                    self.output / name / f"{row['step_idx']:02d}{Path(name).suffix}"
+                )
+        result = []
+        for path in [*sorted(set(paths)), manifest_path]:
+            stat = path.stat()
+            name = str(path.relative_to(self.output))
+            signature = stat.st_mtime_ns, stat.st_size
+            if self._sent.get(name) == signature:
+                continue
+            data = path.read_bytes()
+            result.append(
+                {
+                    "path": name,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": base64.b64encode(data).decode("ascii"),
+                }
+            )
+            self._sent[name] = signature
+        return result
+
+    @staticmethod
+    def receive(output: Path, files: list[dict[str, Any]]) -> int:
+        """Verify the entire delta before writing any file below the owned output."""
+        verified = []
+        seen = set()
+        for item in files:
+            relative = Path(item["path"])
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or not relative.parts
+                or item["path"] in seen
+            ):
+                raise ValueError("invalid or duplicate remote artifact path")
+            destination = output / relative
+            if not destination.resolve().is_relative_to(output.resolve()):
+                raise ValueError("remote artifact escapes its output directory")
+            data = base64.b64decode(item["bytes"], validate=True)
+            if hashlib.sha256(data).hexdigest() != item["sha256"]:
+                raise ValueError(f"remote artifact checksum mismatch: {relative}")
+            verified.append((destination, data))
+            seen.add(item["path"])
+        for destination, data in verified:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(destination.name + ".remote-tmp")
+            temporary.write_bytes(data)
+            temporary.replace(destination)
+        return sum(len(data) for _, data in verified)
+
+
+class ToolkitWorker(RpcFacade):
+    """Own one ordinary RLToolkit and its local simulator daemons."""
+
+    def __init__(self, toolkit: Toolkit, release: contextlib.ExitStack, config: dict):
+        super().__init__()
+        self.toolkit, self.release, self.config = toolkit, release, config
+        self.exchange = ArtifactExchange(Path(config["output_dir"]))
+        self._next_call = 0
+        self._closed = False
+        self._rpc.update(
+            {
+                "rl.describe": self.describe,
+                "rl.execute": self.execute,
+                "rl.close": self.finish,
+            }
+        )
+
+    def describe(self) -> dict:
+        """Return the bound task, original declarations and initial observation."""
+        return {
+            "task": self.config["task"],
+            "max_episode_steps": self.config["max_episode_steps"],
+            "source_digest": source_digest(),
+            "tools": declarations(self.toolkit),
+            "pid": os.getpid(),
+            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            **self._pack(self.toolkit.initial_observation()),
+        }
+
+    def _pack(
+        self, result: ToolResult | None = None, *, solved: bool | None = None
+    ) -> dict:
+        result = result or ToolResult()
+        return {
+            "data": result.data,
+            "images": [
+                base64.b64encode(image).decode("ascii") for image in result.images
+            ],
+            "solved": self.toolkit.solved() if solved is None else solved,
+            "files": self.exchange.collect(),
+        }
+
+    def execute(self, call_id: int, name: str, arguments: dict) -> dict:
+        """Execute each numbered call at most once; uncertain calls are not replayed."""
+        if self._closed or type(call_id) is not int or call_id != self._next_call:
+            raise ValueError("closed session or out-of-order/replayed tool call")
+        self._next_call += 1
+        return self._pack(self.toolkit.execute_tool(name, arguments))
+
+    def finish(self) -> dict:
+        """Flush native video/state before the manager releases this worker."""
+        if not self._closed:
+            self._final_solved = self.toolkit.solved()
+            self.release.close()
+            self._closed = True
+        return self._pack(solved=self._final_solved)
+
+    def _builtin_dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
+        if method == "rl.cancel":
+            self.toolkit.cancel_active_and_wait()
+            return {"cancelled": True}
+        return super()._builtin_dispatch(method, args, kwargs)
+
+    def close(self) -> None:
+        """Release only the services owned by this episode."""
+        self.release.close()
+
+
+class RemoteToolkit(Toolkit):
+    """Keep the planner local while the original toolkit executes on its backend."""
+
+    planner_builtin_tools = False
+
+    def __init__(
+        self, *, endpoint: str, request: dict, config, dashboard_events, memory
+    ):
+        state = EnvState(config.output_dir)
+        super().__init__(state=state, dashboard_events=dashboard_events, memory=memory)
+        self._rpc = make_rpc_client(endpoint)
+        self._output = config.output_dir
+        self._call_lock = threading.Lock()
+        self._call_id = 0
+        self._stopped = threading.Event()
+        self._session = None
+        self._solved = False
+        self._transport_error = None
+        self._heartbeat = None
+        metadata = self._rpc.call(
+            "backend.open", kwargs={"request": request}, timeout_s=1800
+        )
+        self._session = metadata["session"]
+        try:
+            if metadata["source_digest"] != source_digest():
+                raise ValueError(
+                    "remote toolkit source differs from the planner checkout"
+                )
+            if (
+                metadata["task"] != request["task"]
+                or metadata["max_episode_steps"] != request["max_episode_steps"]
+            ):
+                raise ValueError("remote toolkit task or budget mismatch")
+            from robots.rl.backends import RoboCasaPrimitives, RoboTwinPrimitives
+            from robots.rl.tools import LiberoRLPrimitives
+
+            owner = {
+                "libero": LiberoRLPrimitives,
+                "robocasa": RoboCasaPrimitives,
+                "robotwin": RoboTwinPrimitives,
+            }[request["task"]["environment"]]
+            for definition in iter_tools(owner):
+                self.add_tool(definition.with_handler(self._handler(definition.name)))
+            if metadata["tools"] != declarations(self):
+                raise ValueError("remote toolkit declarations differ from the planner")
+            (self._output / "remote-runtime.json").write_text(
+                json.dumps(
+                    {
+                        key: metadata[key]
+                        for key in (
+                            "session",
+                            "pid",
+                            "boot_id",
+                            "source_digest",
+                            "task",
+                            "max_episode_steps",
+                        )
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            self._initial = self._receive(metadata)
+            self._heartbeat = threading.Thread(target=self._renew, daemon=True)
+            self._heartbeat.start()
+        except BaseException:
+            try:
+                self._rpc.call(
+                    "backend.release", kwargs={"session": self._session}, timeout_s=60
+                )
+            except Exception:
+                logger.exception("Failed to release a rejected remote episode")
+            raise
+
+    def _register_common_tools(self) -> None:
+        """Expose only the same clean-workflow declarations as the local toolkit."""
+
+    def _invoke(self, method: str, **kwargs) -> dict:
+        return self._rpc.call(
+            "backend.call",
+            kwargs={"session": self._session, "method": method, "arguments": kwargs},
+            timeout_s=600,
+        )
+
+    def _receive(self, payload: dict) -> ToolResult:
+        transferred = ArtifactExchange.receive(self._output, payload["files"])
+        self.state.reload()
+        self._solved = payload["solved"]
+        trace = self._output / "remote-transfer.jsonl"
+        with trace.open("a") as file:
+            file.write(
+                json.dumps(
+                    {
+                        "call": self._call_id,
+                        "artifact_bytes": transferred,
+                        "files": [
+                            {"path": item["path"], "sha256": item["sha256"]}
+                            for item in payload["files"]
+                        ],
+                    }
+                )
+                + "\n"
+            )
+        return ToolResult(
+            data=payload["data"],
+            images=[
+                base64.b64decode(image, validate=True) for image in payload["images"]
+            ],
+        )
+
+    def _handler(self, name: str):
+        def execute(**kwargs):
+            call_id = self._call_id
+            self._call_id += 1
+            try:
+                return self._receive(
+                    self._invoke(
+                        "rl.execute", call_id=call_id, name=name, arguments=kwargs
+                    )
+                )
+            except Exception as exc:
+                self._transport_error = exc
+                raise
+
+        return execute
+
+    def execute_tool(self, name: str, input_dict: dict[str, Any]) -> ToolResult:
+        with self._call_lock:
+            if self._transport_error is not None:
+                raise RuntimeError(
+                    "remote tool outcome is uncertain; episode must stop"
+                ) from self._transport_error
+            result = super().execute_tool(name, input_dict)
+            if self._transport_error is not None:
+                raise RuntimeError(
+                    "remote tool outcome is uncertain; episode must stop"
+                ) from self._transport_error
+            return result
+
+    def initial_observation(self) -> ToolResult:
+        return self._initial
+
+    def get_env_state(
+        self, *, command: dict, result: dict, elapsed_s: float
+    ) -> ToolResult:
+        """The backend has already captured the original post-action state."""
+        return ToolResult(data=result)
+
+    def solved(self) -> bool:
+        return self._solved
+
+    def _renew(self) -> None:
+        while not self._stopped.wait(30):
+            try:
+                self._rpc.call(
+                    "backend.renew", kwargs={"session": self._session}, timeout_s=15
+                )
+            except Exception:
+                logger.exception("Remote episode lease renewal failed")
+
+    def cancel_active_and_wait(self) -> None:
+        try:
+            if self._session is not None and not self._stopped.is_set():
+                self._invoke("rl.cancel")
+        finally:
+            super().cancel_active_and_wait()
+
+    def close(self) -> None:
+        if self._stopped.is_set():
+            return
+        try:
+            super().close()
+            self._receive(self._invoke("rl.close"))
+        finally:
+            self._stopped.set()
+            if self._heartbeat is not None:
+                self._heartbeat.join(timeout=16)
+            failing = sys.exception() is not None
+            try:
+                self._rpc.call(
+                    "backend.release", kwargs={"session": self._session}, timeout_s=60
+                )
+            except Exception:
+                if not failing:
+                    raise
+                logger.exception("Failed to release remote episode during cleanup")
+
+
+def main() -> None:
+    """Start one backend-owned toolkit worker from its validated configuration."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--configuration", type=Path, required=True)
+    parser.add_argument("--parent-watch", action="store_true")
+    args = parser.parse_args()
+    config = json.loads(args.configuration.read_text())
+    from robots.rl.rl_episode import start_environment
+    from robots.rl.robot_spec import get_robot_spec
+
+    robot_parser = argparse.ArgumentParser()
+    get_robot_spec().add_cli_args(robot_parser, False)
+    robot_args = robot_parser.parse_args([])
+    robot_args.output_dir = Path(config["output_dir"])
+    from rpent.utils.logging import init_output_dir
+
+    init_output_dir(robot_args.output_dir)
+    robot_args.remote_toolkit_endpoint = None
+    robot_args.cuda_device = config["gpu"]
+    robot_args.sam3_endpoint = config["sam3_endpoint"]
+    robot_args.max_episode_steps = config["max_episode_steps"]
+    robot_args.prompt = config["task"].get("prompt", "simple")
+    robot_args.libero_type = config["task"].get("libero_type")
+    release = contextlib.ExitStack()
+    try:
+        toolkit, _ = start_environment(robot_args, config["task"], release)
+        ToolkitWorker(toolkit, release, config).serve(
+            transport="http", host="127.0.0.1", port=0, parent_watch=args.parent_watch
+        )
+    finally:
+        release.close()
+
+
+if __name__ == "__main__":
+    main()

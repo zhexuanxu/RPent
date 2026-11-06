@@ -384,6 +384,46 @@ uv pip install --no-index --no-deps wheelhouse-sglang/*.whl
 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`。
 环境安装和维护须与正在运行的训练进程分开。
 
+## 将 planner 与仿真器部署在不同机器
+
+Adaptive multiturn 支持让 planner 与模型服务部署在一起，将原生仿真器、
+动作内部控制循环和共享 SAM3 留在后端机器。两端须使用相同的控制和工具源码、
+任务 prompt，并均安装 planner 环境。后端额外准备独立的原生仿真环境和资产，
+按前文设置 `RPENT_ROBOCASA_PYTHON`、`RPENT_ROBOTWIN_PYTHON`、
+`ROBOTWIN_ASSETS_PATH` 和 `RPENT_RLINF_ROOT`。
+
+后端先启动共享 SAM3，再启动工具管理器。GPU 容量包含初始化中的 episode，
+须根据该机器的真实驻留容量测试设置：
+
+```bash
+python -m robots.rl.remote_manager \
+  --output-dir /path/to/new-backend-run \
+  --gpu-slots 0:4,1:6 --max-initializing-per-gpu 2 \
+  --sam3-endpoint http://127.0.0.1:8112 --port 28090
+```
+
+服务默认只监听 loopback。先建立私网路由或 SSH 转发，再在 planner 机器运行：
+
+```bash
+export RPENT_REMOTE_TOOLKIT_ENDPOINT=http://127.0.0.1:28090
+unset RPENT_SAM3_ENDPOINT
+bash tools/rl/run.sh --simulator robocasa --task-name PickPlaceCounterToCabinet \
+  --split target --seed 1 --workflow multiturn --cuda-device 1
+```
+
+这里的 `--cuda-device` 指向后端 GPU。后端负责环境和 SAM3 连接，不要再传
+`--env-endpoint` 或 `--sam3-endpoint`。批量入口继承同一远程端点，仍通过
+`--endpoints` 分配模型请求。此远程接口只支持 adaptive multiturn。
+握手会拒绝源码摘要、工具声明、任务或预算不一致的连接。
+
+每条后端 episode 有独立且归管理器所有的 worker，保留配置、日志、原生状态、
+图片和视频。变化的产物通过 SHA-256 校验后，以原始字节同步到 planner 目录；
+相关文件写入后才发布 `states.json`。`remote-runtime.json` 记录 worker
+身份和源码，`remote-transfer.jsonl` 记录文件哈希和传输量。Planner transcript
+和 wire trace 留在 planner 机器。传输失败会终止 episode，不重放结果不明的
+动作。模型推理期间由心跳续租；planner 失联后，已就绪的后端 worker 会在
+五分钟后释放，文件继续保留。
+
 ## RLinf 与 SFT
 
 RLinf 的独立环境和 `run_train.sh` 配置见它自己的

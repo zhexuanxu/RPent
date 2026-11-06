@@ -21,6 +21,17 @@ second calls ``update_todo``; later replies execute exactly one tool. These
 tools replace explicit bounded state. There is no implicit summary or file
 memory. See the setup guide for invocation, schemas and retained traces.
 
+Remote simulator host
+---------------------
+
+``--remote-toolkit-endpoint`` (or ``RPENT_REMOTE_TOOLKIT_ENDPOINT``) connects
+adaptive multiturn to ``python -m robots.rl.remote_manager`` on another host.
+Motion loops, native rendering and SAM3 stay on the backend; the planner keeps
+the original tool schemas, responses and image bytes. In this mode,
+``--cuda-device`` selects a backend GPU. The backend owns its environment and
+SAM3 connections. Source/task/budget checks, per-GPU capacities, artifact hash
+verification and lease cleanup are described in the setup guide above.
+
 The remainder describes the retained LIBERO multiturn interface.
 
 LIBERO multiturn overview

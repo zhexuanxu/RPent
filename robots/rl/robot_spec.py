@@ -73,6 +73,16 @@ def get_toolkit(
     config: RunConfig,
 ):
     """Return the adaptive toolkit for the selected simulator and workflow."""
+    if "remote_endpoint" in runtime_kwargs:
+        from robots.rl.remote import RemoteToolkit
+
+        return RemoteToolkit(
+            endpoint=runtime_kwargs["remote_endpoint"],
+            request=runtime_kwargs["remote_request"],
+            config=config,
+            dashboard_events=dashboard_events,
+            memory=MemoryManager(get_memory_dir("rl")),
+        )
     from robots.rl.toolkit import RLToolkit
 
     return RLToolkit(
@@ -145,6 +155,11 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         help="[protocol://]host:port of an existing env_server; spawned when unset.",
     )
     parser.add_argument(
+        "--remote-toolkit-endpoint",
+        default=os.environ.get("RPENT_REMOTE_TOOLKIT_ENDPOINT"),
+        help="Remote RL backend; motion, perception and simulator run on its GPUs.",
+    )
+    parser.add_argument(
         "--sam3-endpoint",
         default=None,
         help="[protocol://]host:port of an existing SAM3 server; spawned when unset.",
@@ -174,6 +189,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("rl requires images from view_env; remove --no-images")
     if getattr(args, "workflow", "multiturn") == "zap" and args.planner != "api":
         raise ValueError("zap requires --planner api")
+    if getattr(args, "remote_toolkit_endpoint", None) is not None:
+        if getattr(args, "workflow", "multiturn") != "multiturn":
+            raise ValueError("remote toolkit currently supports --workflow multiturn")
+        if args.env_endpoint is not None or args.sam3_endpoint is not None:
+            raise ValueError(
+                "remote toolkit owns its env/SAM3; remove separate endpoints"
+            )
 
 
 def _skip_memory(args: argparse.Namespace, config: RunConfig) -> None:
@@ -387,6 +409,22 @@ def _init_runtime(
     components: set[str] | None,
 ) -> tuple[list[ProcessDaemon], dict[str, Any]]:
     """Start or connect the environment and SAM3 services."""
+    if getattr(args, "remote_toolkit_endpoint", None) is not None:
+        config = _parse_config(args)
+        task = dict(config.task_desc)
+        task.update(split=args.split, task_config=args.task_config)
+        if task["environment"] == "libero":
+            from rpent.utils.config import get_libero_type
+
+            task["libero_type"] = args.libero_type or get_libero_type()
+        return [], {
+            "remote_endpoint": args.remote_toolkit_endpoint,
+            "remote_request": {
+                "task": task,
+                "gpu": args.cuda_device,
+                "max_episode_steps": args.max_episode_steps,
+            },
+        }
     from rpent.robots.components.sam3_client import Sam3Client
 
     starters = {"env": _start_env, "sam3": _start_sam3}

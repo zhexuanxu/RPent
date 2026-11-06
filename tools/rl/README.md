@@ -431,6 +431,52 @@ With all assets present, export `HF_HUB_OFFLINE=1` and
 `TRANSFORMERS_OFFLINE=1` in runtime terminals. Keep environment installation
 separate from active training processes.
 
+## Planner and simulator on separate hosts
+
+Adaptive multiturn can place the planner beside the model servers and keep
+native simulators, motion loops and shared SAM3 on a backend host. Both ends
+must use identical control/tool source and task prompts. Install the planner
+environment on both hosts; install the isolated native simulators and assets
+on the backend, configuring `RPENT_ROBOCASA_PYTHON`, `RPENT_ROBOTWIN_PYTHON`,
+`ROBOTWIN_ASSETS_PATH` and `RPENT_RLINF_ROOT` as above.
+
+Start shared SAM3 on the backend, then its toolkit manager. GPU capacities
+include initializing episodes; choose them from a real resident-capacity test:
+
+```bash
+python -m robots.rl.remote_manager \
+  --output-dir /path/to/new-backend-run \
+  --gpu-slots 0:4,1:6 --max-initializing-per-gpu 2 \
+  --sam3-endpoint http://127.0.0.1:8112 --port 28090
+```
+
+The listener defaults to loopback. Establish a private route or SSH forward
+before running the planner. On the planner host:
+
+```bash
+export RPENT_REMOTE_TOOLKIT_ENDPOINT=http://127.0.0.1:28090
+unset RPENT_SAM3_ENDPOINT
+bash tools/rl/run.sh --simulator robocasa --task-name PickPlaceCounterToCabinet \
+  --split target --seed 1 --workflow multiturn --cuda-device 1
+```
+
+Here `--cuda-device` selects a backend GPU. The backend owns both the env and
+SAM3 connections; do not also pass `--env-endpoint` or `--sam3-endpoint`.
+The batch launcher inherits the same remote endpoint and distributes model
+requests with `--endpoints`. This remote interface supports adaptive multiturn
+only. The handshake rejects different source digests, tool declarations,
+tasks or budgets.
+
+Each backend episode has an owned worker and retained configuration, log,
+native state, images and video. Changed artifacts travel with SHA-256 checksums
+and retain their original bytes in the planner directory; `states.json` is
+published after its files. `remote-runtime.json` identifies the worker/source;
+`remote-transfer.jsonl` records file hashes and transferred sizes. Planner
+transcripts and wire traces remain on the planner host. Transport failure
+aborts the episode without replaying an action whose outcome is unknown.
+A heartbeat renews the lease while the model reasons; a disconnected planner's
+ready worker is released after five minutes, preserving its files.
+
 ## RLinf and SFT
 
 Use RLinf's `examples/agent/rpent/README.md` for its own environment and

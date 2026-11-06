@@ -19,6 +19,16 @@ ZAP snapshot 循环
 第二轮调用 ``update_todo``，之后每轮仅执行一个工具。query 和 todo 显式、有界地
 完整替换，不使用隐式总结或文件记忆。启动方式、工具及完整轨迹说明见安装运行指南。
 
+远程仿真后端
+----------------------------------------------------------------
+
+``--remote-toolkit-endpoint`` 或 ``RPENT_REMOTE_TOOLKIT_ENDPOINT`` 可将
+adaptive multiturn 连接到另一台机器上的
+``python -m robots.rl.remote_manager``。动作循环、原生渲染和 SAM3 留在
+后端，planner 使用原有工具声明、结果和原始图片字节。此时
+``--cuda-device`` 选择后端 GPU，环境和 SAM3 连接均由后端负责。
+源码、任务与预算校验、每 GPU 容量、产物哈希校验及租约清理详见前文安装指南。
+
 以下说明保留的 LIBERO multiturn 接口。
 
 LIBERO multiturn 概览
