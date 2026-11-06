@@ -608,7 +608,7 @@ def main() -> int:
 
     # --- agent loop --------------------------------------------------------
     t0 = time.time()
-    finish_result, messages, agent_error = None, [], None
+    finish_result, messages, agent_error, agent_error_kind = None, [], None, None
     stats: dict = {}
     first_user_msg: str | None = user_msg
     if await_first_prompt is not None:
@@ -700,6 +700,7 @@ def main() -> int:
                 messages += result.messages
                 stats = result.stats
                 agent_error = result.error
+                agent_error_kind = getattr(result, "error_kind", None)
                 if getattr(toolkit, "direct_verdict_requested", False):
                     finish_result = toolkit.finalize_direct_verdict()
                     if agent_error:
@@ -749,6 +750,7 @@ def main() -> int:
                 break
     except Exception as exc:
         agent_error = f"{type(exc).__name__}: {exc}"
+        agent_error_kind = "runtime_error"
         logger.error("EXCEPTION in agent loop: %s", agent_error)
     finally:
         if operator_input is not None:
@@ -769,6 +771,7 @@ def main() -> int:
         "elapsed_s": round(elapsed, 1),
         "finish": finish_result,
         "error": agent_error,
+        "error_kind": agent_error_kind,
         "environment_success": environment_success,
         "stats": stats,
         "messages": _serialize_messages(messages),

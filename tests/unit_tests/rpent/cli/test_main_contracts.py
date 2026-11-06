@@ -769,13 +769,19 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
 
 @pytest.mark.parametrize("planner_name", ["codex", "flash"])
 @pytest.mark.parametrize(
-    "planner_error", [None, "RuntimeError: Grasp not held; replay stopped"]
+    ("planner_error", "planner_error_kind"),
+    [
+        (None, None),
+        ("RuntimeError: Grasp not held; replay stopped", "model_error"),
+        ("planner response truncated", "response_truncated"),
+    ],
 )
 def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     planner_name: str,
     planner_error: str | None,
+    planner_error_kind: str | None,
 ) -> None:
     cli = _cli_module()
     from rpent.evaluation import RunFinalizationContext, write_json_atomic
@@ -808,6 +814,7 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
                 messages=[],
                 stats={"tool_calls": 0},
                 error=planner_error,
+                error_kind=planner_error_kind,
             )
 
     def add_cli_args(parser: Any, use_dashboard: bool) -> None:
@@ -886,6 +893,7 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     assert cli.main() == (1 if planner_error else 0)
     transcript = json.loads((tmp_path / "transcript_OpenDrawer_s1.json").read_text())
     assert transcript["error"] == planner_error
+    assert transcript["error_kind"] == planner_error_kind
 
     assert len(captured) == 1
     context = captured[0]
