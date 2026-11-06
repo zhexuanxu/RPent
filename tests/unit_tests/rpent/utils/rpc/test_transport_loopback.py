@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -355,3 +356,25 @@ def test_transport_timeout_does_not_wedge_the_server(transport: Transport) -> No
 
         assert running.client.call("healthz", timeout_s=1.0) == {"status": "ok"}
         assert running.facade.delay_finished.wait(timeout=1.0)
+
+
+def test_http_accepts_simultaneous_independent_episode_requests() -> None:
+    count = 100
+    barrier = threading.Barrier(count)
+    with _running_facade("http") as running:
+
+        def request(index):
+            client = HttpRpcClient(f"http://127.0.0.1:{running.port}")
+            barrier.wait(timeout=10)
+            return client.call(
+                "combine",
+                args=(np.asarray([index], dtype=np.int64),),
+                kwargs={"scale": 2, "metadata": {"episode": index}},
+                timeout_s=5,
+            )
+
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            responses = list(pool.map(request, range(count)))
+        assert [x["metadata"]["episode"] for x in responses] == list(range(count))
+        for index, response in enumerate(responses):
+            np.testing.assert_array_equal(response["values"], [index * 2])

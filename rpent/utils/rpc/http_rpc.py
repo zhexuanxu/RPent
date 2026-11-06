@@ -214,6 +214,9 @@ class HttpRpcServer(ThreadingHTTPServer):
 
     allow_reuse_address = True
     daemon_threads = True
+    # Episode workers can connect together after a shared pause or startup.
+    # The stdlib backlog of five can reset their sockets before dispatch.
+    request_queue_size = 256
 
     def __init__(
         self,
