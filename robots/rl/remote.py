@@ -145,16 +145,18 @@ class ToolkitWorker(RpcFacade):
         self.exchange = ArtifactExchange(Path(config["output_dir"]))
         self._next_call = 0
         self._closed = False
+        self._initial = toolkit.initial_observation()
         self._rpc.update(
             {
                 "rl.describe": self.describe,
+                "rl.observe": self.observe,
                 "rl.execute": self.execute,
                 "rl.close": self.finish,
             }
         )
 
     def describe(self) -> dict:
-        """Return the bound task, original declarations and initial observation."""
+        """Return a small identity handshake before transferring native artifacts."""
         return {
             "task": self.config["task"],
             "max_episode_steps": self.config["max_episode_steps"],
@@ -162,8 +164,13 @@ class ToolkitWorker(RpcFacade):
             "tools": declarations(self.toolkit),
             "pid": os.getpid(),
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-            **self._pack(self.toolkit.initial_observation()),
         }
+
+    def observe(self) -> dict:
+        """Transfer the initial observation under an already renewable lease."""
+        if self._closed:
+            raise ValueError("session is closed")
+        return self._pack(self._initial)
 
     def _pack(
         self, result: ToolResult | None = None, *, solved: bool | None = None
@@ -266,10 +273,13 @@ class RemoteToolkit(Toolkit):
                 )
                 + "\n"
             )
-            self._initial = self._receive(metadata)
             self._heartbeat = threading.Thread(target=self._renew, daemon=True)
             self._heartbeat.start()
+            self._initial = self._receive(self._invoke("rl.observe", timeout_s=1800))
         except BaseException:
+            self._stopped.set()
+            if self._heartbeat is not None:
+                self._heartbeat.join(timeout=16)
             try:
                 self._rpc.call(
                     "backend.release", kwargs={"session": self._session}, timeout_s=60
@@ -281,11 +291,11 @@ class RemoteToolkit(Toolkit):
     def _register_common_tools(self) -> None:
         """Expose only the same clean-workflow declarations as the local toolkit."""
 
-    def _invoke(self, method: str, **kwargs) -> dict:
+    def _invoke(self, method: str, *, timeout_s: float = 600, **kwargs) -> dict:
         return self._rpc.call(
             "backend.call",
             kwargs={"session": self._session, "method": method, "arguments": kwargs},
-            timeout_s=600,
+            timeout_s=timeout_s,
         )
 
     def _receive(self, payload: dict) -> ToolResult:

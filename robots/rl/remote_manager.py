@@ -164,6 +164,7 @@ class BackendManager(RpcFacade):
                 with self._lock:
                     self._workers[session]["rpc"] = rpc
                 metadata = rpc.call("rl.describe", timeout_s=300)
+                self._worker(session)
                 (output / "identity.json").write_text(
                     json.dumps(
                         {
@@ -188,7 +189,7 @@ class BackendManager(RpcFacade):
 
     def call(self, session: str, method: str, arguments: dict) -> dict:
         """Forward an allowed toolkit operation, without automatic replay."""
-        if method not in ("rl.execute", "rl.close", "rl.cancel"):
+        if method not in ("rl.observe", "rl.execute", "rl.close", "rl.cancel"):
             raise ValueError("unsupported toolkit operation")
         row = self._worker(session)
         if row["rpc"] is None:

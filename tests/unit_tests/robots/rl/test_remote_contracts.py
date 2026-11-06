@@ -129,7 +129,7 @@ def test_remote_preserves_native_tools_observations_and_original_bytes(connected
     assert remote.declarations(client) == remote.declarations(connected.toolkit)
     assert client.initial_observation().data["state"]["step"] == 0
     invalid = client.execute_tool("move_to", {"xyz": "bad"})
-    assert invalid.is_error and not connected.bridge.calls
+    assert invalid.is_error and connected.bridge.calls == ["rl.observe"]
     moved = client.execute_tool("move_to", {"xyz": [0.1, -0.2, 0.9]})
     # Native success terminates this fixture before the requested pose settles.
     assert moved.data["status"] == "partial"
@@ -164,6 +164,29 @@ def test_response_loss_cannot_become_a_tool_error_and_replay_the_action(connecte
     assert connected.bridge.calls.count("rl.execute") == 1
     client.close()
     assert connected.bridge.released
+
+
+def test_lease_is_running_before_initial_artifact_transfer(connected, monkeypatch):
+    lease_started = threading.Event()
+
+    def renew(client):
+        lease_started.set()
+        client._stopped.wait()
+
+    original_observe = connected.worker.observe
+
+    def observe():
+        assert lease_started.wait(timeout=2), "initial transfer began without a lease"
+        return original_observe()
+
+    monkeypatch.setattr(remote.RemoteToolkit, "_renew", renew)
+    connected.worker._rpc["rl.observe"] = observe
+    assert "files" not in connected.worker.describe()
+    client = connected.connect()
+    try:
+        assert client.state.latest_step == 0
+    finally:
+        client.close()
 
 
 def test_close_releases_owned_worker_even_if_cancellation_connection_fails(connected):
