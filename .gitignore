@@ -32,3 +32,8 @@ build/
 /.venv-sglang/
 /wheelhouse-rpent/
 /wheelhouse-sglang/
+
+# Local shared-workflow configuration and isolated simulator environments.
+/.rl-env.sh
+/.venv-robocasa/
+/.venv-robotwin/

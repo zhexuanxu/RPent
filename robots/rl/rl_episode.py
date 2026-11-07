@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run one LIBERO RL episode for an RL trainer.
+"""Run one shared-workflow simulator episode for an RL trainer.
 
 An RL trainer such as RLinf starts this module once per episode on the node
 that hosts the simulator, with the OpenAI-compatible endpoint that serves its
-policy. The end-effector planner solves the task with a fresh LIBERO
+policy. The end-effector planner solves the task with a fresh simulator
 environment and the running SAM3 service, with adaptive observations.
 The outcome is written to ``outcome.json`` in ``--output-dir``.
 RPent keeps per-process state such as the output directory, so every episode

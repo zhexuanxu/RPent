@@ -20,6 +20,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from robots.rl.prompt_bundle import validate_workflow
 from robots.rl.tools import LiberoRLPrimitives
 from rpent.dashboard.events import DashboardEventSink
 from rpent.memory import MemoryManager
@@ -46,10 +47,10 @@ class RLToolkit(Toolkit):
         output_dir: Path | str,
         environment: str = "libero",
         workflow: str = "multiturn",
-        task_prompt: Path | None = None,
     ) -> None:
         if observation_mode != "adaptive":
             raise ValueError("rl supports only adaptive observations")
+        validate_workflow(environment, workflow)
         state = EnvState(output_dir)
         super().__init__(dashboard_events=dashboard_events, state=state, memory=memory)
         self._images_sent = 0
@@ -67,10 +68,6 @@ class RLToolkit(Toolkit):
             state=state, check_cancelled=self.raise_if_cancelled, **runtime_kwargs
         )
         self._task = self._primitives.env.get_task_language()
-        if task_prompt is not None and task_prompt.is_file():
-            self._task = (
-                task_prompt.read_text().strip().replace("{{task_language}}", self._task)
-            )
         self._publish_step(self._primitives.record_observation())
         self._recorded_env_steps = 0
         self.snapshot = None
@@ -81,13 +78,9 @@ class RLToolkit(Toolkit):
                 self._primitives,
                 environment=environment,
                 task=self._task,
-                max_episode_steps=(
-                    runtime_kwargs["max_episode_steps"]
-                    if environment != "libero"
-                    else self._primitives.env._client.call("env.get_env_meta")[
-                        "max_episode_steps"
-                    ]
-                ),
+                max_episode_steps=self._primitives.env._client.call("env.get_env_meta")[
+                    "max_episode_steps"
+                ],
             )
         for definition in iter_tools(self._primitives):
             if workflow == "zap" and definition.name in {

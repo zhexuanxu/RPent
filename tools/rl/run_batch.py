@@ -32,11 +32,11 @@ import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+from robots.rl.prompt_bundle import PROMPT_VARIANTS, validate_workflow
 from rpent.evaluation import write_json_atomic as atomic
 from rpent.evaluation.trajectory import audit_episode
 
 EVAL_DIR = Path(__file__).resolve().parent
-PROMPTS = ("simple", "base", "base_gripper", "base_gripper_camera")
 CONFIGS = ("adaptive",)
 LOCK = threading.Lock()
 STOP = threading.Event()
@@ -291,6 +291,8 @@ def collect(args: argparse.Namespace, batch: Path) -> None:
             "Retry count and start interval must be nonnegative; timeout must be positive"
         )
     jobs = read_jobs(Path(args.jobs), args.seeds)
+    for job in jobs:
+        validate_workflow(job["environment"], args.workflow)
     identity = {
         "jobs": jobs,
         "prompt": args.prompt,
@@ -545,7 +547,7 @@ def main() -> None:
     collection.add_argument(
         "--workflow", choices=("multiturn", "zap"), default="multiturn"
     )
-    collection.add_argument("--prompt", choices=PROMPTS, default="simple")
+    collection.add_argument("--prompt", choices=PROMPT_VARIANTS, default="simple")
     collection.add_argument(
         "--endpoints", help="Comma-separated local OpenAI base URLs"
     )

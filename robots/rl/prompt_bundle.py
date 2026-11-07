@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Interface contract prompts for LIBERO RL rollouts, in four levels of detail.
+"""Compose shared workflow instructions with each simulator's tool contract.
 
-``simple`` is the bare tool contract. The other variants add what the robot
-and its sensors are, in the order of the Astra prompt ablation: ``base``
-describes the arm, its frames, the execution of a motion and how to work;
-``base_gripper`` adds the finger geometry; ``base_gripper_camera`` adds the
-camera geometry. Numbers come from the LIBERO scene and the robosuite Panda
-gripper model, and describe this tool set only.
+LIBERO multiturn retains its four established prompt variants. Other supported
+combinations read one shared contract, one robot description, and one workflow
+file. Task instructions come directly from the simulator, not prompt files.
 """
 
 from __future__ import annotations
@@ -64,6 +61,24 @@ CAMERA = """Cameras
 - Pixels are [row, col] from the top-left corner. A pixel alone fixes only a ray; segment and back_project return the depth-measured world point of the visible surface, so world_xyz lies on the object's top or facing side rather than its center, and top_z_m is its highest visible point.
 - Use pixels, masks and poses from the same observation step, and take a new observation after every motion."""
 
+ENVIRONMENT_WORKFLOWS = {
+    "libero": ("multiturn", "zap"),
+    "robocasa": ("multiturn",),
+    "robotwin": ("multiturn",),
+}
+
+
+def validate_workflow(environment: str, workflow: str) -> None:
+    """Reject unsupported combinations before any simulator is started."""
+    if environment not in ENVIRONMENT_WORKFLOWS:
+        raise ValueError(f"unsupported simulator: {environment!r}")
+    if workflow not in ENVIRONMENT_WORKFLOWS[environment]:
+        raise ValueError(
+            f"{environment} does not support --workflow {workflow}; "
+            f"choose {' or '.join(ENVIRONMENT_WORKFLOWS[environment])}"
+        )
+
+
 PROMPT_VARIANTS = ("simple", "base", "base_gripper", "base_gripper_camera")
 _SECTIONS = {
     "simple": (),
@@ -80,19 +95,13 @@ def system_prompt(variables: Mapping[str, object] | None = None) -> str:
         raise ValueError("rl supports only adaptive observations")
     environment = str(variables.get("environment", "libero"))
     workflow = str(variables.get("workflow", "multiturn"))
-    if environment not in ("libero", "robocasa", "robotwin") or workflow not in (
-        "multiturn",
-        "zap",
-    ):
-        raise ValueError("unsupported environment or workflow")
+    validate_workflow(environment, workflow)
     if environment != "libero" or workflow == "zap":
         prompts = Path(__file__).parent / "prompts"
         return "\n\n".join(
             (prompts / name).read_text().strip()
             for name in ("shared.md", f"{environment}.md", f"{workflow}.md")
         )
-    if variables.get("observation_mode", "adaptive") != "adaptive":
-        raise ValueError("rl supports only adaptive observations")
     variant = str(variables.get("prompt", "simple"))
     if variant not in _SECTIONS:
         raise ValueError(

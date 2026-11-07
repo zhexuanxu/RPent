@@ -421,6 +421,56 @@ def test_prompt_variants_nest_from_simple_to_camera() -> None:
         render("fancy")
 
 
+@pytest.mark.parametrize(
+    "environment,workflow",
+    [
+        ("libero", "multiturn"),
+        ("libero", "zap"),
+        ("robocasa", "multiturn"),
+        ("robotwin", "multiturn"),
+    ],
+)
+def test_supported_combinations_use_native_tasks_without_prompt_files(
+    environment, workflow, tmp_path
+):
+    args = argparse.Namespace(
+        env=environment,
+        workflow=workflow,
+        suite="libero_goal",
+        task=1,
+        task_name="example_task",
+        seed=0,
+        observation_mode="adaptive",
+        prompt="simple",
+        output_dir=tmp_path,
+    )
+    config = robot_spec.get_robot_spec().parse_config(args)
+    assert "task_prompt" not in config.prompt_vars
+    assert robot_spec.get_robot_spec().prompts.render(
+        "system", variables=config.prompt_vars
+    )
+
+
+@pytest.mark.parametrize("environment", ["robocasa", "robotwin"])
+def test_unsupported_zap_fails_before_accessing_native_runtime(environment, tmp_path):
+    args = argparse.Namespace(
+        env=environment, workflow="zap", observation_mode="adaptive"
+    )
+    with pytest.raises(ValueError, match="does not support --workflow zap"):
+        robot_spec.get_robot_spec().parse_config(args)
+    with pytest.raises(ValueError, match="does not support --workflow zap"):
+        RLToolkit(
+            runtime_kwargs={},
+            dashboard_events=NullDashboardEventSink(),
+            memory=MemoryManager(tmp_path / "memory"),
+            observation_mode="adaptive",
+            output_dir=tmp_path / "run",
+            environment=environment,
+            workflow="zap",
+        )
+    assert not (tmp_path / "run").exists()
+
+
 def test_prompt_variant_reaches_the_prompt_variables() -> None:
     args = argparse.Namespace(
         suite="libero_goal",
@@ -436,8 +486,6 @@ def test_prompt_variant_reaches_the_prompt_variables() -> None:
         "prompt": "base_gripper",
         "environment": "libero",
         "workflow": "multiturn",
-        "task_prompt": robot_spec.get_repo_root()
-        / "robots/rl/prompts/tasks/libero/libero_goal_t1.md",
     }
     assert config.task_desc["prompt"] == "base_gripper"
 

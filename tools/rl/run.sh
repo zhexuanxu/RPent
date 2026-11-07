@@ -16,7 +16,7 @@ if [[ -n "${RPENT_SAM3_ENDPOINT:-}" ]]; then
   runtime_args+=(--sam3-endpoint "$RPENT_SAM3_ENDPOINT")
 fi
 output="${RPENT_OUTPUT_DIR:-$RPENT_REPO_ROOT/logs/rl-$mode-$prompt-$(date +%Y%m%d-%H%M%S)}"
-exec python -m rpent.cli.main --robot rl --libero-type pro \
+exec python -m rpent.cli.main --robot rl \
   --observation-mode "$mode" --prompt "$prompt" \
   "${runtime_args[@]}" \
   "${planner_args[@]}" \

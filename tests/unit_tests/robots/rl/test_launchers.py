@@ -131,3 +131,53 @@ def test_runtime_paths_are_relocatable_and_explicit_values_win(
         str(expected_root / "models/sam3/sam3.pt"),
         str(expected_root / "libero-config"),
     ]
+
+
+@pytest.mark.parametrize(
+    "simulator,workflow,task_args",
+    [
+        ("libero", "multiturn", ["--suite", "libero_object", "--task", "0"]),
+        ("libero", "zap", ["--suite", "libero_object", "--task", "0"]),
+        ("robocasa", "multiturn", ["--task-name", "PickPlaceCounterToCabinet"]),
+        ("robotwin", "multiturn", ["--task-name", "click_alarmclock"]),
+    ],
+)
+def test_single_episode_launcher_preserves_the_selected_simulator_and_workflow(
+    tmp_path, simulator, workflow, task_args
+):
+    executable = tmp_path / "rpent"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "print(json.dumps({'argv': sys.argv[1:], 'libero_type': os.environ['LIBERO_TYPE']}))\n"
+    )
+    executable.chmod(0o755)
+    (tmp_path / "python").symlink_to(executable)
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPTS / "run.sh"),
+            "--simulator",
+            simulator,
+            "--workflow",
+            workflow,
+            *task_args,
+        ],
+        env={
+            **_environment(),
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "RPENT_MODEL": "openai-chat:qwen3.8-27b",
+            "RPENT_BASE_URL": "http://localhost:30080/v1",
+            "LIBERO_TYPE": "standard",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    request = json.loads(result.stdout)
+    argv = request["argv"]
+    assert argv[argv.index("--robot") + 1] == "rl"
+    assert argv[argv.index("--simulator") + 1] == simulator
+    assert argv[argv.index("--workflow") + 1] == workflow
+    assert "--libero-type" not in argv
+    assert request["libero_type"] == "standard"

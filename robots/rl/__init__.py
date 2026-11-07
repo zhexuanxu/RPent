@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LIBERO rollouts driven by end-effector tools under a chosen observation mode."""
+"""Adaptive VLM control: three multiturn simulators and LIBERO ZAP snapshots."""
 
 from robots.rl.robot_spec import get_robot_spec, get_toolkit
 

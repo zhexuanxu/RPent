@@ -14,6 +14,7 @@
 
 """Task failures count as evaluations without becoming valid training samples."""
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -81,3 +82,27 @@ def test_resume_rejects_a_modified_evaluation(tmp_path):
     assert batch.evaluated(tmp_path)["success"] is False
     transcript.write_text("damaged response")
     assert batch.evaluated(tmp_path) is None
+
+
+@pytest.mark.parametrize("environment", ["robocasa", "robotwin"])
+def test_zap_batch_rejects_native_jobs_before_writing_manifest(tmp_path, environment):
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(
+        json.dumps(
+            [{"environment": environment, "task_name": "example_task", "seed": 1}]
+        )
+    )
+    output = tmp_path / "batch"
+    output.mkdir()
+    args = argparse.Namespace(
+        infrastructure_retries=1,
+        episode_timeout=14400,
+        start_interval=0,
+        max_initializing_per_gpu=1,
+        jobs=jobs,
+        seeds=None,
+        workflow="zap",
+    )
+    with pytest.raises(ValueError, match="does not support --workflow zap"):
+        batch.collect(args, output)
+    assert not (output / "manifest.json").exists()

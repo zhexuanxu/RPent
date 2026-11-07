@@ -32,6 +32,7 @@ from robots.rl.prompt_bundle import (
     PROMPT_VARIANTS,
     system_prompt,
     user_prompt,
+    validate_workflow,
 )
 from rpent.dashboard.events import DashboardEventSink
 from rpent.evaluation import RunFinalizationContext, write_json_atomic
@@ -94,7 +95,6 @@ def get_toolkit(
         output_dir=config.output_dir,
         environment=config.prompt_vars.get("environment", "libero"),
         workflow=config.prompt_vars.get("workflow", "multiturn"),
-        task_prompt=config.prompt_vars.get("task_prompt"),
     )
 
 
@@ -129,7 +129,7 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         "--observation-mode",
         choices=OBSERVATION_MODES,
         default="adaptive",
-        help="Adaptive observations: camera images are returned by view_env.",
+        help="Adaptive camera observations: view_env in multiturn, automatic in zap.",
     )
     parser.add_argument(
         "--prompt",
@@ -174,6 +174,9 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
 
 def _validate_args(args: argparse.Namespace) -> None:
     """Reject options that would change the fixed rollout setup unnoticed."""
+    validate_workflow(
+        getattr(args, "env", "libero"), getattr(args, "workflow", "multiturn")
+    )
     if args.planner not in SUPPORTED_PLANNERS:
         raise ValueError(
             f"rl supports --planner {' or '.join(SUPPORTED_PLANNERS)}; "
@@ -186,7 +189,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.observation_mode != "adaptive":
         raise ValueError("rl supports only adaptive observations")
     if args.no_images:
-        raise ValueError("rl requires images from view_env; remove --no-images")
+        raise ValueError("rl requires camera images; remove --no-images")
     if getattr(args, "workflow", "multiturn") == "zap" and args.planner != "api":
         raise ValueError("zap requires --planner api")
     if getattr(args, "remote_toolkit_endpoint", None) is not None:
@@ -208,6 +211,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         raise ValueError("rl supports only adaptive observations")
     environment = getattr(args, "env", "libero")
     workflow = getattr(args, "workflow", "multiturn")
+    validate_workflow(environment, workflow)
     if environment == "libero" and not args.suite:
         raise ValueError("--suite is required")
     if environment == "libero" and args.task is None:
@@ -233,14 +237,6 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "prompt": args.prompt,
             "environment": environment,
             "workflow": workflow,
-            "task_prompt": get_repo_root()
-            / "robots/rl/prompts/tasks"
-            / environment
-            / (
-                f"{args.suite}_t{args.task}.md"
-                if environment == "libero"
-                else f"{args.task_name}.md"
-            ),
         },
         task_desc={
             "suite": args.suite,
