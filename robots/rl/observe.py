@@ -208,9 +208,11 @@ class Observe:
                     self.tk.state.artifact_path(f"{camera}.png", step=step)
                 ) as image:
                     width, height = image.size
+                from robots.rl.toolkit import uses_native_1024
+
                 size = (
                     (self.tk.image_size,) * 2
-                    if self.tk.environment == "libero"
+                    if uses_native_1024(self.tk.environment, self.tk.world_cord)
                     else (height, width)
                 )
                 self.images[image_id] = ImageSource(

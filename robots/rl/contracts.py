@@ -171,7 +171,13 @@ def validate_relations(name: str, arguments: dict) -> None:
 
 
 def validate_options(
-    environment, workflow, action_mode, max_actions, reasoning, images
+    environment,
+    workflow,
+    action_mode,
+    max_actions,
+    reasoning,
+    images,
+    world_cord="base",
 ):
     """Reject unsupported non-default options before allocating a simulator."""
     if action_mode not in {"single", "batch"} or max_actions < 1:
@@ -182,13 +188,31 @@ def validate_options(
         raise ValueError("pear requires one move_to or set_gripper call per reply")
     if reasoning < -1 or images < -1:
         raise ValueError("history limits must be -1 or a nonnegative integer")
-    if (
-        environment != "libero" or workflow not in {"episode", "episode_image", "pear"}
-    ) and (
+    supported = (
+        environment == "libero" and workflow in {"episode", "episode_image", "pear"}
+    ) or (
+        environment == "robocasa" and workflow == "episode" and world_cord == "general"
+    )
+    if not supported and (
         action_mode != "single" or reasoning != -1 or images != -1 or max_actions != 3
     ):
         raise ValueError(
-            "action/history options currently support LIBERO episode and episode_image only"
+            "action/history options currently support LIBERO episode/episode_image and RoboCasa general episode only"
+        )
+
+
+def validate_image_size(environment: str, world_cord: str, image_size: int) -> None:
+    """Reject unsupported VLM image sizes before starting a simulator."""
+    from robots.rl.images import IMAGE_SIZES
+
+    if image_size not in IMAGE_SIZES:
+        raise ValueError(f"unsupported image size {image_size}")
+    if image_size != 1024 and not (
+        environment == "libero"
+        or (environment == "robocasa" and world_cord == "general")
+    ):
+        raise ValueError(
+            "--image_size currently supports LIBERO and RoboCasa general only"
         )
 
 
@@ -208,12 +232,18 @@ def validate_perception_options(workflow, mode="single", max_calls=8, concurrenc
 
 def argument_hint(name: str, environment: str = "libero") -> str:
     """Short actionable model feedback, independently of validator formatting."""
-    if environment != "libero" and name in {"move_to", "set_gripper"}:
+    if environment == "robotwin" and name in {"move_to", "set_gripper"}:
         return "Follow the declared native action fields and orientation convention; include the selected arm where required."
+    if environment == "robocasa" and name in {"move_to", "set_gripper"}:
+        return (
+            "Follow the declared move_to/set_gripper fields and orientation convention."
+        )
     return {
         "segment": "Supply exactly one non-empty prompt or point [row,col]; follow the tool's camera/step requirements.",
         "back_project": "Supply exactly one pixel, box or mask_id; pixel/box must match the displayed camera and frame.",
         "move_to": "Supply xyz, orientation_rpy, or both as three finite numbers.",
+        "move_base": "Supply bounded local velocities vx/vy/yaw_rate and duration_s within the declared limits.",
+        "move_lift": "Supply delta_m within +/-0.25 and duration_s within 0.1..5.",
         "observe": "Use calls with unique id/op; view_env has camera only; segment/back_project need an issued source or @view.camera/@segment. Fix the whole list before retrying.",
         "execute_actions": "Supply a non-empty actions list within K; each item must be move_to with a target or set_gripper with opening 0..1.",
     }.get(name, "Follow the declared required fields and value ranges.")
@@ -223,8 +253,10 @@ def validate_coordinates(environment: str, world_cord: str) -> None:
     """Reject unsupported frames before starting a simulator."""
     if world_cord not in {"base", "general"}:
         raise ValueError("world_cord must be base or general")
-    if environment != "libero" and world_cord != "base":
-        raise ValueError("general coordinates currently support LIBERO only")
+    if environment not in {"libero", "robocasa"} and world_cord != "base":
+        raise ValueError(
+            "general coordinates currently support LIBERO and RoboCasa only"
+        )
 
 
 def coordinate_definition(declaration, world_cord: str):

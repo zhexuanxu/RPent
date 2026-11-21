@@ -122,7 +122,7 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         "--world-cord",
         choices=("base", "general"),
         default="base",
-        help="base: existing simulator world; general: mounted robot-base frame and finger-pad TCP (LIBERO only).",
+        help="base: existing simulator world; general: mounted robot-base frame and finger-pad TCP (LIBERO and RoboCasa).",
     )
     parser.add_argument("--action-mode", choices=("single", "batch"), default="single")
     parser.add_argument("--max-actions-per-call", type=int, default=3)
@@ -236,36 +236,33 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
 
 def _validate_args(args: argparse.Namespace) -> None:
     """Reject options that would change the fixed rollout setup unnoticed."""
-    validate_workflow(
-        getattr(args, "env", "libero"), getattr(args, "workflow", "episode")
-    )
-    if (
-        getattr(args, "image_size", 1024) != 1024
-        and getattr(args, "env", "libero") != "libero"
-    ):
-        raise ValueError("--image_size currently supports LIBERO only")
+    environment = getattr(args, "env", "libero")
+    workflow = getattr(args, "workflow", "episode")
+    world_cord = getattr(args, "world_cord", "base")
+    validate_workflow(environment, workflow)
     from robots.rl.contracts import (
         validate_coordinates,
+        validate_image_size,
         validate_options,
         validate_perception_options,
     )
 
-    validate_coordinates(
-        getattr(args, "env", "libero"), getattr(args, "world_cord", "base")
-    )
+    validate_coordinates(environment, world_cord)
+    validate_image_size(environment, world_cord, getattr(args, "image_size", 1024))
     validate_perception_options(
-        getattr(args, "workflow", "episode"),
+        workflow,
         getattr(args, "perception_mode", "single"),
         getattr(args, "max_observe_calls", 8),
         getattr(args, "observe_concurrency", 8),
     )
     validate_options(
-        getattr(args, "env", "libero"),
-        getattr(args, "workflow", "episode"),
+        environment,
+        workflow,
         getattr(args, "action_mode", "single"),
         getattr(args, "max_actions_per_call", 3),
         getattr(args, "reasoning_history", -1),
         getattr(args, "image_history", -1),
+        world_cord=world_cord,
     )
     import math
 
@@ -308,18 +305,19 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         raise ValueError("rl supports only adaptive observations")
     environment = getattr(args, "env", "libero")
     workflow = getattr(args, "workflow", "episode")
+    world_cord = getattr(args, "world_cord", "base")
     validate_workflow(environment, workflow)
     from robots.rl.contracts import (
         validate_coordinates,
+        validate_image_size,
         validate_options,
         validate_perception_options,
     )
 
-    validate_coordinates(
-        getattr(args, "env", "libero"), getattr(args, "world_cord", "base")
-    )
+    validate_coordinates(environment, world_cord)
+    validate_image_size(environment, world_cord, getattr(args, "image_size", 1024))
     validate_perception_options(
-        getattr(args, "workflow", "episode"),
+        workflow,
         getattr(args, "perception_mode", "single"),
         getattr(args, "max_observe_calls", 8),
         getattr(args, "observe_concurrency", 8),
@@ -331,6 +329,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         getattr(args, "max_actions_per_call", 3),
         getattr(args, "reasoning_history", -1),
         getattr(args, "image_history", -1),
+        world_cord=world_cord,
     )
     if environment == "libero" and not args.suite:
         raise ValueError("--suite is required")
@@ -453,6 +452,12 @@ def _start_env(
         }
         if simulator_python:
             overrides["LD_LIBRARY_PATH"] = _simulator_library_path(simulator_python)
+        camera_args = (
+            ["--camera-h", "1024", "--camera-w", "1024"]
+            if environment == "robocasa"
+            and getattr(args, "world_cord", "base") == "general"
+            else []
+        )
         return _spawn_server(
             args,
             output_dir,
@@ -471,6 +476,7 @@ def _start_env(
                 args.task_config,
                 "--max-episode-steps",
                 str(args.max_episode_steps),
+                *camera_args,
                 *(["--assets-path", str(args.assets_path)] if args.assets_path else []),
             ],
             overrides,
@@ -628,14 +634,15 @@ def _connect_env(args: argparse.Namespace, rpc) -> dict[str, Any]:
     elif environment == "robocasa":
         from robots.robocasa.env_client import RoboCasaEnvClient
 
+        camera_size = 1024 if getattr(args, "world_cord", "base") == "general" else 256
         env = RoboCasaEnvClient(
             rpc,
             expected_meta={
                 "task_name": args.task_name,
                 "split": args.split,
                 "seed": args.seed,
-                "camera_h": 256,
-                "camera_w": 256,
+                "camera_h": camera_size,
+                "camera_w": camera_size,
             },
         )
     else:
@@ -689,9 +696,16 @@ def configure_planner(planner, config: RunConfig):
         WorkflowCapability(toolkit, system, user, turns, timeout_s=planner.timeout_s),
         *(
             [HistoryRetention(toolkit)]
-            if config.prompt_vars.get("environment", "libero") == "libero"
-            and config.prompt_vars.get("workflow", "episode")
-            in {"episode", "episode_image", "pear"}
+            if (
+                config.prompt_vars.get("environment", "libero") == "libero"
+                and config.prompt_vars.get("workflow", "episode")
+                in {"episode", "episode_image", "pear"}
+            )
+            or (
+                config.prompt_vars.get("environment", "libero") == "robocasa"
+                and config.prompt_vars.get("workflow", "episode") == "episode"
+                and config.prompt_vars.get("world_cord", "base") == "general"
+            )
             else []
         ),
     ]

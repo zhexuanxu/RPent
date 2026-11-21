@@ -408,10 +408,17 @@ def collect(args: argparse.Namespace, batch: Path) -> None:
     jobs = read_jobs(Path(args.jobs), args.seeds)
     for job in jobs:
         validate_workflow(job["environment"], args.workflow)
-        from robots.rl.contracts import validate_coordinates, validate_options
+        from robots.rl.contracts import (
+            validate_coordinates,
+            validate_image_size,
+            validate_options,
+        )
 
-        validate_coordinates(job["environment"], args.world_cord)
-
+        world_cord = getattr(args, "world_cord", "base")
+        validate_coordinates(job["environment"], world_cord)
+        validate_image_size(
+            job["environment"], world_cord, getattr(args, "image_size", 1024)
+        )
         validate_options(
             job["environment"],
             args.workflow,
@@ -419,6 +426,7 @@ def collect(args: argparse.Namespace, batch: Path) -> None:
             getattr(args, "max_actions_per_call", 3),
             getattr(args, "reasoning_history", -1),
             getattr(args, "image_history", -1),
+            world_cord=world_cord,
         )
     identity = {
         "jobs": jobs,

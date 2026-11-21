@@ -163,7 +163,30 @@ class LiberoRLPrimitives:
 
     def surface_points(self, native_points: np.ndarray) -> np.ndarray:
         """Filter invalid native depth, then convert before statistics or z filters."""
-        return self.coordinates.points(geometry.valid_points(native_points))
+        return self._model_points(geometry.valid_points(native_points))
+
+    def _model_points(self, native: np.ndarray) -> np.ndarray:
+        return self.coordinates.points(native)
+
+    def _surface_center(self, native: np.ndarray, points: np.ndarray) -> np.ndarray:
+        return np.median(points, axis=0)
+
+    def _surface_sample(
+        self, samples: np.ndarray, z_range_m: list[float] | None = None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Select corresponding native and model-frame points before aggregation."""
+        native = geometry.valid_points(samples)
+        points = self._model_points(native)
+        if z_range_m is not None:
+            low, high = z_range_m
+            keep = (low <= points[:, 2]) & (points[:, 2] <= high)
+            native, points = native[keep], points[keep]
+        center = self._surface_center(native, points) if len(points) else None
+        return points, center
+
+    def _geometry_metadata(self) -> dict[str, Any]:
+        """Optional frame provenance attached to geometry measurements."""
+        return {}
 
     def _step(self, action: np.ndarray) -> None:
         self._check_cancelled()
@@ -248,7 +271,10 @@ class LiberoRLPrimitives:
                 Rotation.from_euler("xyz", orientation_rpy).as_matrix()
             )
         )
+        return self._move_world_pose(target, goal)
 
+    def _move_world_pose(self, target: np.ndarray, goal: np.ndarray) -> ToolResult:
+        """Servo one already-resolved world TCP pose through the native controller."""
         config = self._config
         errors: list[tuple[float, float]] = []
         reason = None
@@ -306,6 +332,10 @@ class LiberoRLPrimitives:
         """
         if self.ended:
             return _error("episode_ended")
+        return self._drive_gripper(opening)
+
+    def _drive_gripper(self, opening: float) -> ToolResult:
+        """Hold the initial TCP pose while driving and measuring the fingers."""
         config = self._config
         hold = self._measure_native()
         hold_xyz = self._tcp_world(hold).copy()
@@ -533,7 +563,8 @@ class LiberoRLPrimitives:
             if segmentation.box is not None
             else geometry.box_from_mask(mask)
         )
-        surface = geometry.surface_geometry(self.surface_points(world[mask]))
+        points, center = self._surface_sample(world[mask])
+        surface = geometry.surface_geometry(points, center=center)
         if surface is None:
             data.update(
                 dict.fromkeys(("world_xyz", "top_z_m", "size_xyz_m", "axis_yaw")),
@@ -541,6 +572,7 @@ class LiberoRLPrimitives:
             )
         else:
             data.update(surface)
+            data.update(self._geometry_metadata())
         image = self._state.load(f"{camera}.png", step=index)
         self._state.save(f"{mask_id}.png", _overlay(image, mask), step=index)
         return ToolResult(data=data)
@@ -586,24 +618,22 @@ class LiberoRLPrimitives:
                 return _error("z_range_m applies to box and mask")
             if not _inside(pixel, world.shape):
                 return _error("pixel outside the image")
-            points = self.surface_points(world[pixel[0], pixel[1]])
+            samples = world[pixel[0], pixel[1]]
         else:
             if box is not None:
                 row_min, col_min = max(box[0], 0), max(box[1], 0)
-                points = world[row_min : box[2], col_min : box[3]]
+                samples = world[row_min : box[2], col_min : box[3]]
             else:
-                points = world[mask]
-            points = self.surface_points(points)
-            if z_range_m is not None:
-                low, high = z_range_m
-                points = points[(points[:, 2] >= low) & (points[:, 2] <= high)]
+                samples = world[mask]
+        points, center = self._surface_sample(samples, z_range_m)
         needed = 1 if pixel is not None else MIN_REGION_POINTS
-        if len(points) < needed:
+        if center is None or len(points) < needed:
             return _error(f"insufficient depth: {len(points)} valid points")
         return ToolResult(
             data={
                 "step": step,
-                "world_xyz": [round(float(v), 4) for v in np.median(points, axis=0)],
+                **self._geometry_metadata(),
+                "world_xyz": [round(float(v), 4) for v in center],
             }
         )
 

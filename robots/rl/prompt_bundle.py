@@ -128,8 +128,8 @@ def system_prompt(variables: Mapping[str, object] | None = None) -> str:
         (prompts / name).read_text().strip()
         for name in (
             "shared.md",
-            "libero_general.md"
-            if environment == "libero" and general
+            f"{environment}_general.md"
+            if environment in {"libero", "robocasa"} and general
             else f"{environment}.md",
             "episode_observe.md" if perception == "batch" else f"{workflow}.md",
         )
@@ -146,13 +146,22 @@ def system_prompt(variables: Mapping[str, object] | None = None) -> str:
         sections.append(
             f"Each observe accepts at most {variables.get('max_observe_calls', 8)} suboperations. Independent operations are scheduled with concurrency at most {variables.get('observe_concurrency', 8)}."
         )
-    if environment == "libero" and workflow in {"episode", "episode_image"}:
+    if (environment == "libero" and workflow in {"episode", "episode_image"}) or (
+        environment == "robocasa" and workflow == "episode" and general
+    ):
         if variables.get("action_mode", "single") == "batch":
-            sections.append(
-                "Action interface: use execute_actions for every physical action, including single-item lists. move_to and set_gripper are not standalone tools. Maximum list length is "
-                + str(variables.get("max_actions_per_call", 3))
-                + ". Items execute in order and stop on partial/error/success/truncation. Read every measured result before deciding the next batch; remaining items after a stop did not execute."
-            )
+            if environment == "robocasa":
+                sections.append(
+                    "Action interface: use execute_actions for move_to and set_gripper, including single-item lists. move_to and set_gripper are not standalone tools; move_base and move_lift remain standalone tools. Maximum list length is "
+                    + str(variables.get("max_actions_per_call", 3))
+                    + ". Items execute in order and stop on partial/error/success/truncation. Read every measured result before deciding the next batch; remaining items after a stop did not execute."
+                )
+            else:
+                sections.append(
+                    "Action interface: use execute_actions for every physical action, including single-item lists. move_to and set_gripper are not standalone tools. Maximum list length is "
+                    + str(variables.get("max_actions_per_call", 3))
+                    + ". Items execute in order and stop on partial/error/success/truncation. Read every measured result before deciding the next batch; remaining items after a stop did not execute."
+                )
         sections.append(
             "The request may omit old reasoning and camera images according to configured history retention. Omitted images are unavailable: do not pretend to see their pixels. Tool calls and measured text results remain available, subject to conversation compaction."
         )

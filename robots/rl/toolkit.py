@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 from robots.rl.images import (
-    IMAGE_SIZES,
     NATIVE_SIZE,
     native_pixel,
     resize_image,
@@ -38,6 +37,30 @@ from rpent.session import EnvState
 from rpent.tools import ToolResult, iter_tools
 from rpent.tools.toolkit import Toolkit
 from rpent.utils.serialization import write_json
+
+
+def primitive_owner(environment: str, world_cord: str = "base"):
+    """Select the same primitive owner class for local and remote execution."""
+    if environment == "libero":
+        return LiberoRLPrimitives
+    from robots.rl.backends import (
+        RoboCasaGeneralPrimitives,
+        RoboCasaPrimitives,
+        RoboTwinPrimitives,
+    )
+
+    if environment == "robocasa":
+        return (
+            RoboCasaGeneralPrimitives if world_cord == "general" else RoboCasaPrimitives
+        )
+    return RoboTwinPrimitives
+
+
+def uses_native_1024(environment: str, world_cord: str = "base") -> bool:
+    """Return whether the selected environment renders native 1024x1024 RGB-D."""
+    return environment == "libero" or (
+        environment == "robocasa" and world_cord == "general"
+    )
 
 
 def primitive_definitions(primitives, *, workflow, action_mode, perception_mode):
@@ -102,14 +125,16 @@ class RLToolkit(Toolkit):
         if observation_mode != "adaptive":
             raise ValueError("rl supports only adaptive observations")
         validate_workflow(environment, workflow)
-        from robots.rl.contracts import validate_coordinates
+        from robots.rl.contracts import (
+            validate_coordinates,
+            validate_image_size,
+            validate_options,
+            validate_perception_options,
+        )
 
         validate_coordinates(environment, world_cord)
         self.world_cord, self.reasoning = world_cord, reasoning
-        if image_size not in IMAGE_SIZES:
-            raise ValueError(f"unsupported image size {image_size}")
-        from robots.rl.contracts import validate_options
-
+        validate_image_size(environment, world_cord, image_size)
         validate_options(
             environment,
             workflow,
@@ -117,9 +142,8 @@ class RLToolkit(Toolkit):
             max_actions_per_call,
             reasoning_history,
             image_history,
+            world_cord=world_cord,
         )
-        from robots.rl.contracts import validate_perception_options
-
         validate_perception_options(
             workflow, perception_mode, max_observe_calls, observe_concurrency
         )
@@ -141,19 +165,14 @@ class RLToolkit(Toolkit):
         self._images_sent = 0
         self._images_lock = threading.Lock()
         self.environment, self.workflow = environment, workflow
-        primitive_type = LiberoRLPrimitives
-        if environment != "libero":
-            from robots.rl.backends import RoboCasaPrimitives, RoboTwinPrimitives
-
-            primitive_type = {
-                "robocasa": RoboCasaPrimitives,
-                "robotwin": RoboTwinPrimitives,
-            }[environment]
+        primitive_type = primitive_owner(environment, world_cord)
         native_options = dict(runtime_kwargs)
         if environment == "libero":
             native_options.update(
                 world_cord=world_cord, capture_geometry=workflow != "pear"
             )
+        elif environment == "robocasa" and world_cord == "general":
+            native_options.update(world_cord=world_cord)
         self._primitives = primitive_type(
             state=state, check_cancelled=self.raise_if_cancelled, **native_options
         )
@@ -196,7 +215,7 @@ class RLToolkit(Toolkit):
                 *self.observer.cameras,
                 "all",
             ]
-            if environment == "libero":
+            if uses_native_1024(environment, world_cord):
                 for model, fields in (
                     ("SegmentCall", ("point",)),
                     ("ProjectCall", ("pixel", "box")),
@@ -357,7 +376,10 @@ class RLToolkit(Toolkit):
             validate_relations(name, arguments)
             if name == "observe":
                 self.observer.compile(arguments["calls"])
-            if self.environment == "libero" and self.image_size != NATIVE_SIZE:
+            if (
+                uses_native_1024(self.environment, self.world_cord)
+                and self.image_size != NATIVE_SIZE
+            ):
                 for field in ("point", "pixel"):
                     if arguments.get(field) is not None:
                         arguments[field] = native_pixel(
@@ -376,7 +398,10 @@ class RLToolkit(Toolkit):
                 model_text=f"Invalid {name} arguments: {exc}. {argument_hint(name, self.environment)} No tool executed; correct the arguments and try again.",
             )
         result = self._execute_validated(declaration, input_dict, arguments)
-        if self.environment == "libero" and self.image_size != NATIVE_SIZE:
+        if (
+            uses_native_1024(self.environment, self.world_cord)
+            and self.image_size != NATIVE_SIZE
+        ):
             result.images = [
                 resize_image(image, self.image_size) for image in result.images
             ]

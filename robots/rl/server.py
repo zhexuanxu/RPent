@@ -67,6 +67,8 @@ def main() -> None:
     parser.add_argument("--split", default="target")
     parser.add_argument("--task-config", default="demo_randomized")
     parser.add_argument("--assets-path")
+    parser.add_argument("--camera-h", type=int, default=256)
+    parser.add_argument("--camera-w", type=int, default=256)
     parser.add_argument("--max-episode-steps", type=int, default=10000)
     parser.add_argument("--cuda-device", type=int)
     parser.add_argument("--transport", choices=("socket", "http"), default="http")
@@ -134,7 +136,13 @@ def main() -> None:
                 )
                 return {"arm_origin_rotation": arm_rotation, "base_theta": theta}
 
-        facade = CleanRoboCasaFacade(args.task_name, split=args.split, seed=args.seed)
+        facade = CleanRoboCasaFacade(
+            args.task_name,
+            split=args.split,
+            seed=args.seed,
+            camera_h=args.camera_h,
+            camera_w=args.camera_w,
+        )
     else:
         if args.cuda_device is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_device)

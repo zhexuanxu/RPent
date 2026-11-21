@@ -71,7 +71,9 @@ def valid_points(points: np.ndarray) -> np.ndarray:
     return flat[keep]
 
 
-def surface_geometry(points: np.ndarray) -> dict[str, Any] | None:
+def surface_geometry(
+    points: np.ndarray, *, center: np.ndarray | None = None
+) -> dict[str, Any] | None:
     """Summarize visible surface points, or return None when too few exist."""
     if len(points) < MIN_SURFACE_POINTS:
         return None
@@ -83,7 +85,7 @@ def surface_geometry(points: np.ndarray) -> dict[str, Any] | None:
         heading = math.atan2(axes[1, 1], axes[0, 1])
         axis_yaw = round((heading + math.pi / 2) % math.pi - math.pi / 2, 3)
     return {
-        "world_xyz": _rounded(np.median(points, axis=0)),
+        "world_xyz": _rounded(np.median(points, axis=0) if center is None else center),
         "top_z_m": round(float(high[2]), 4),
         "size_xyz_m": _rounded(high - low),
         "axis_yaw": axis_yaw,

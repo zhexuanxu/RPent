@@ -34,7 +34,9 @@ class ScenePrimitives(LiberoRLPrimitives):
 
     cameras: tuple[str, ...]
 
-    surface_points = staticmethod(geometry.valid_points)
+    @staticmethod
+    def _model_points(native: np.ndarray) -> np.ndarray:
+        return native
 
     def __init__(
         self,
@@ -201,7 +203,7 @@ class RoboCasaPrimitives(ScenePrimitives):
         super().__init__(**kwargs)
         self._meta = self.env._client.call("env.control_meta")
         self._open_gap = max(float(self._meta["gripper_max_gap"]), 1e-3)
-        self._hold_opening = self.measure().opening
+        self._hold_opening = self._opening()
 
     def native_success(self) -> bool:
         self._success |= bool(self.env.check_success())
@@ -210,11 +212,14 @@ class RoboCasaPrimitives(ScenePrimitives):
     def _finger_gap(self) -> float:
         return float(np.abs(self.env.gripper_qpos).sum())
 
+    def _opening(self) -> float:
+        return min(1.0, self._finger_gap() / self._open_gap)
+
     def measure(self) -> Measurement:
         return Measurement(
             self.env.eef_pos,
             Rotation.from_quat(self.env.eef_quat).as_matrix(),
-            min(1.0, self._finger_gap() / self._open_gap),
+            self._opening(),
         )
 
     def robot_state(self) -> dict[str, Any]:
@@ -284,9 +289,7 @@ class RoboCasaPrimitives(ScenePrimitives):
             local[3:] = base.T @ local[3:]
         start, stop = self._meta["slices"]["right"]
         native[start:stop] = self._native("right", local)
-        native[6] = float(
-            np.clip(4 * (self.measure().opening - self._hold_opening), -1, 1)
-        )
+        native[6] = float(np.clip(4 * (self._opening() - self._hold_opening), -1, 1))
         self.env.step(native)
         self.env_steps += 1
 
@@ -457,6 +460,367 @@ class RoboCasaPrimitives(ScenePrimitives):
         return rotation.T @ (
             (rotation @ physical - (high + low) / 2) / ((high - low) / 2)
         )
+
+
+class RoboCasaGeneralPrimitives(RoboCasaPrimitives):
+    """Dynamic mount-frame general coordinates, pad-midpoint TCP, base and lift control."""
+
+    BASE_LIMITS = np.array([0.35, 0.35, 0.5], dtype=float)
+    move_to = LiberoRLPrimitives.move_to
+    measure = LiberoRLPrimitives.measure
+    _model_points = LiberoRLPrimitives._model_points
+
+    def _surface_center(self, native: np.ndarray, points: np.ndarray) -> np.ndarray:
+        # Coordinate-wise medians depend on the axes. Keep the representative
+        # point fixed in the recorded cloud when the arm mount turns.
+        return self.coordinates.points(np.median(native, axis=0))
+
+    def __init__(self, *, world_cord: str = "general", **kwargs) -> None:
+        if world_cord != "general":
+            raise ValueError("RoboCasaGeneralPrimitives requires world_cord='general'")
+        super().__init__(**kwargs)
+        self._refresh_coordinates()
+        self._state.save("coordinates.json", self._coordinates_metadata(), step=None)
+
+    def _measure_native(self) -> Measurement:
+        self._control = self.env._client.call("env.coordinate_calibration")
+        return Measurement(
+            np.asarray(self._control["site_xyz"], dtype=np.float64),
+            np.asarray(self._control["site_rotation"], dtype=np.float64),
+            self._opening(),
+        )
+
+    def _tcp_world(self, current: Measurement) -> np.ndarray:
+        return np.asarray(self._control["pad_tcp_xyz"], dtype=np.float64)
+
+    def _refresh_coordinates(self) -> Measurement:
+        from robots.rl.coordinates import Coordinates
+
+        native = self._measure_native()
+        self.coordinates = Coordinates.from_control("general", self._control)
+        return Measurement(
+            self.coordinates.points(self._tcp_world(native)),
+            self.coordinates.orientation(native.rotation),
+            native.opening,
+        )
+
+    def _coordinates_metadata(self) -> dict[str, Any]:
+        metadata = {
+            **self.coordinates.metadata(),
+            "support_surface_kind": self._control.get("support_surface_kind"),
+            "support_surface_source": self._control.get("support_surface_source"),
+            "lift_m": round(float(self._control["lift_m"]), 6)
+            if "lift_m" in self._control
+            else None,
+            "pad_tcp_world_m": np.asarray(
+                self._control["pad_tcp_xyz"], dtype=float
+            ).tolist(),
+            "site_world_m": np.asarray(self._control["site_xyz"], dtype=float).tolist(),
+        }
+        if "jaw_slide_axes_site" in self._control:
+            metadata["jaw_slide_axes_site"] = np.asarray(
+                self._control["jaw_slide_axes_site"], dtype=float
+            ).tolist()
+        return metadata
+
+    def _geometry_metadata(self) -> dict[str, Any]:
+        return {"coordinate_step": self._state.latest_step}
+
+    def robot_state(self) -> dict[str, Any]:
+        measured = self._refresh_coordinates()
+        return {
+            **measured.state(),
+            "finger_gap_m": round(self._finger_gap(), 5),
+            "lift_m": round(float(self._control["lift_m"]), 4),
+            "coordinates": self.coordinates.description(),
+            "env_steps": self.env_steps,
+        }
+
+    def capture(self, camera: str):
+        rgb, depth = self.env.render_camera(camera, depth=True, mask_invalid_depth=True)
+        meta = self.env.get_camera_meta(camera)
+        transform = self.env._client.call(
+            "env.get_camera_transform",
+            kwargs={
+                "camera_name": self.env._resolve_cam(camera),
+                "height": self.env.camera_h,
+                "width": self.env.camera_w,
+            },
+        )
+        depth_arr = np.asarray(depth, dtype=np.float64)
+        near_m = float(meta["depth_near"])
+        far_m = float(meta["depth_far"])
+        valid = (
+            np.isfinite(depth_arr)
+            & (depth_arr > near_m * (1.0 + 1e-4))
+            & (depth_arr < far_m * (1.0 - 1e-5))
+        )
+        safe_depth = np.where(valid, depth_arr, 0.0)
+        rows, cols = np.mgrid[: depth_arr.shape[0], : depth_arr.shape[1]]
+        homogeneous = np.stack(
+            (
+                cols * safe_depth,
+                rows * safe_depth,
+                safe_depth,
+                np.ones_like(safe_depth),
+            ),
+            axis=-1,
+        )
+        world = (homogeneous @ np.asarray(transform, dtype=np.float64).T)[..., :3]
+        world[~valid] = np.nan
+        return (
+            np.asarray(rgb),
+            world,
+            {
+                "pixel_to_world": np.asarray(transform).tolist(),
+                "height": depth_arr.shape[0],
+                "width": depth_arr.shape[1],
+                "intrinsic_K": np.asarray(meta["intrinsic"]).tolist(),
+                "depth_near": near_m,
+                "depth_far": far_m,
+            },
+        )
+
+    def record_observation(self, *, command=None, result=None, elapsed_s=None):
+        state = self.robot_state()
+        with self._state.record_step(
+            state=state,
+            terminated=self.native_success(),
+            truncated=self.env_steps >= self._max_episode_steps,
+            command=command,
+            result=result,
+            elapsed_s=elapsed_s,
+            extras={"env_steps": self.env_steps},
+        ) as step:
+            self._save("step_coordinates.json", self._coordinates_metadata(), step)
+            for camera in self.cameras:
+                rgb, world, calibration = self.capture(camera)
+                self._save(f"{camera}_raw.png", rgb, step)
+                rgb = self.annotate(rgb, calibration)
+                self._save(f"{camera}.png", rgb, step)
+                self._save(f"{camera}_world.npz", world.astype(np.float32), step)
+                self._save(f"{camera}_calibration.json", calibration, step)
+                if camera == self.cameras[0]:
+                    self.frames.append(rgb)
+        return self._state.get(step)
+
+    @tool
+    def set_gripper(
+        self, opening: Annotated[float, Field(ge=0.0, le=1.0)]
+    ) -> ToolResult:
+        """Drive the gripper to a normalized opening while holding the current pose. Closing on an object stops early and reports the measured opening; contact does not imply a stable grasp. The target stays in effect during later moves. Returns reached/partial/error, measured pose/opening, residual opening error and environment steps. Example: {"opening":1}.
+
+        Args:
+            opening: Target opening from 0 (closed) to 1 (fully open).
+        """
+        if self.ended:
+            return ToolResult(data={"error": "episode_ended"})
+        self._hold_opening = float(opening)
+        result = self._drive_gripper(opening)
+        result.data["opening"] = round(self._opening(), 3)
+        return result
+
+    def _mobility_state(self):
+        self._refresh_coordinates()
+        return (
+            np.asarray(self._control["mobile_base_xyz"], dtype=float).copy(),
+            Rotation.from_matrix(self._control["mobile_base_rotation"]),
+            self.coordinates.origin.copy(),
+        )
+
+    def _mobile_step(
+        self, velocity=None, lift: float = 0.0, *, check_cancelled: bool = True
+    ) -> None:
+        if check_cancelled:
+            self._check_cancelled()
+        if self.env_steps >= self._max_episode_steps:
+            return
+        native = np.zeros(12)
+        # Track the installed arm goal while the base or lifting support moves.
+        native[-1] = 1
+        start, stop = self._meta["slices"]["base"]
+        native[start:stop] = self._base_velocity(
+            np.zeros(3) if velocity is None else velocity
+        )
+        start, stop = self._meta["slices"]["torso"]
+        native[start:stop] = self._native("torso", np.array([lift]))
+        native[6] = float(np.clip(4 * (self._opening() - self._hold_opening), -1, 1))
+        self.env.step(native)
+        self.env_steps += 1
+
+    def _mobility_delta(self, before):
+        """Measure translation and signed heading change in the starting chassis frame."""
+        after = self._mobility_state()
+        initial_frame = before[1].inv()
+        displacement = initial_frame.apply(after[0] - before[0])
+        forward = (initial_frame * after[1]).as_matrix()[:, 0]
+        yaw = float(np.arctan2(forward[1], forward[0]))
+        return displacement, yaw, float(after[2][2] - before[2][2])
+
+    def _mobility_feedback(self, motion, start_steps, request, reason):
+        displacement, yaw, height_change = motion
+        return {
+            "status": "reached" if reason == "completed" else "partial",
+            "reason": reason,
+            "requested": request,
+            "displacement_initial_base_m": np.round(displacement, 4).tolist(),
+            "yaw_change_rad": round(yaw, 4),
+            "mount_height_change_m": round(height_change, 4),
+            "executed_steps": self.env_steps - start_steps,
+            "executed_duration_s": round(
+                (self.env_steps - start_steps) / self._meta["control_freq"], 4
+            ),
+            "env_steps": self.env_steps,
+        }
+
+    @tool
+    def move_base(
+        self,
+        vx: Annotated[float, Field(ge=-0.35, le=0.35)] = 0,
+        vy: Annotated[float, Field(ge=-0.35, le=0.35)] = 0,
+        yaw_rate: Annotated[float, Field(ge=-0.5, le=0.5)] = 0,
+        duration_s: Annotated[float, Field(ge=0.1, le=2)] = 1,
+    ) -> ToolResult:
+        """Move the mobile base at bounded velocity in its current local frame, then stop. Hold the arm's installed pose and existing gripper target. Contacts can prevent motion; read actual displacement and call view_env before choosing the next arm motion.
+
+        Args:
+            vx: Forward speed in m/s, -0.35 to 0.35.
+            vy: Leftward speed in m/s, -0.35 to 0.35.
+            yaw_rate: Counterclockwise speed in rad/s, -0.5 to 0.5.
+            duration_s: Requested duration, 0.1 to 2 seconds, including a final stop step.
+        """
+        physical = np.asarray([vx, vy, yaw_rate], dtype=float)
+        cfg = self._meta["parts"]["base"]
+        if (
+            not np.isfinite(physical).all()
+            or not np.isfinite(duration_s)
+            or not 0.1 <= duration_s <= 2
+            or np.any(np.abs(physical) > self.BASE_LIMITS)
+            or np.any(physical < cfg["actuator_min"])
+            or np.any(physical > cfg["actuator_max"])
+        ):
+            return ToolResult(
+                data={"error": "Invalid mobile-base velocity or duration"}
+            )
+        if self.ended:
+            return ToolResult(data={"error": "episode_ended"})
+        before, start_steps = self._mobility_state(), self.env_steps
+        requested_steps = max(2, round(duration_s * self._meta["control_freq"]))
+        count = min(requested_steps, self._max_episode_steps - self.env_steps)
+        reason = "completed"
+        drive_steps = 0
+        try:
+            for _ in range(max(0, count - 1)):
+                if self.ended:
+                    reason = "episode_ended"
+                    break
+                self._mobile_step(physical)
+                drive_steps += 1
+        finally:
+            if not self.ended and self.env_steps < self._max_episode_steps:
+                self._mobile_step(check_cancelled=False)
+        if self.ended:
+            reason = "episode_ended" if self.native_success() else "budget_exhausted"
+        elif count < requested_steps:
+            reason = "budget_exhausted"
+        motion = self._mobility_delta(before)
+        displacement, yaw, _ = motion
+        result = self._mobility_feedback(
+            motion,
+            start_steps,
+            {"vx": vx, "vy": vy, "yaw_rate": yaw_rate, "duration_s": duration_s},
+            reason,
+        )
+        duration = drive_steps / self._meta["control_freq"]
+        expected_yaw = yaw_rate * duration
+        # Integrate constant body-frame velocity along its arc in the initial frame.
+        half_yaw = expected_yaw / 2
+        velocity = Rotation.from_euler("z", half_yaw).apply([vx, vy, 0])[:2]
+        expected_xy = duration * np.sinc(half_yaw / np.pi) * velocity
+        residual_xy = expected_xy - displacement[:2]
+        expected_distance = float(np.linalg.norm(expected_xy))
+        translation_error = float(np.linalg.norm(residual_xy))
+        yaw_error = expected_yaw - yaw
+        result["translation_error_m"] = round(translation_error, 4)
+        result["translation_shortfall_m"] = round(
+            float(residual_xy @ expected_xy) / expected_distance
+            if expected_distance
+            else 0.0,
+            4,
+        )
+        result["yaw_shortfall_rad"] = round(float(np.sign(expected_yaw) * yaw_error), 4)
+        if reason == "completed":
+            result["status"] = "commanded"
+            if translation_error > max(0.05, expected_distance * 0.25) or abs(
+                yaw_error
+            ) > max(0.0524, abs(expected_yaw) * 0.25):
+                result.update(status="partial", reason="limited_motion")
+        return ToolResult(data=result)
+
+    @tool
+    def move_lift(
+        self,
+        delta_m: Annotated[float, Field(ge=-0.25, le=0.25)],
+        duration_s: Annotated[float, Field(ge=0.1, le=5)] = 3,
+    ) -> ToolResult:
+        """Raise or lower the arm's mounting support relative to its current measured height. Hold the installed arm pose and existing gripper target. Inspect achieved height change, updated support surface height, and call view_env before choosing the next arm motion; joint limits or contacts may cause a partial result.
+
+        Args:
+            delta_m: Signed vertical change in mounting-support height, metres; positive raises, negative lowers, within +/-0.25.
+            duration_s: Execution budget from 0.1 to 5 seconds, including a final stop step.
+        """
+        if (
+            not np.isfinite([delta_m, duration_s]).all()
+            or not -0.25 <= delta_m <= 0.25
+            or not 0.1 <= duration_s <= 5
+        ):
+            return ToolResult(data={"error": "Invalid lift displacement or duration"})
+        if self.ended:
+            return ToolResult(data={"error": "episode_ended"})
+        before, start_steps = self._mobility_state(), self.env_steps
+        target = before[2][2] + delta_m
+        count = min(
+            max(2, round(duration_s * self._meta["control_freq"])),
+            self._max_episode_steps - self.env_steps,
+        )
+        reason = "motion_budget"
+        previous, still = before[2][2], 0
+        cfg = self._meta["parts"]["torso"]
+        try:
+            for _ in range(max(0, count - 1)):
+                if self.ended:
+                    reason = "episode_ended"
+                    break
+                height = self._mobility_state()[2][2]
+                error = target - height
+                if abs(error) <= 0.004:
+                    reason = "completed"
+                    break
+                still = still + 1 if abs(height - previous) < 0.0002 else 0
+                previous = height
+                if still >= 12:
+                    reason = "blocked_or_joint_limit"
+                    break
+                low, high = float(cfg["output_min"][0]), float(cfg["output_max"][0])
+                self._mobile_step(
+                    lift=float(np.clip(error, max(low, -0.025), min(high, 0.025)))
+                )
+        finally:
+            if not self.ended and self.env_steps < self._max_episode_steps:
+                self._mobile_step(check_cancelled=False)
+        motion = self._mobility_delta(before)
+        height_error = delta_m - motion[2]
+        if self.ended:
+            reason = "episode_ended" if self.native_success() else "budget_exhausted"
+        elif abs(height_error) <= 0.004:
+            reason = "completed"
+        elif reason == "completed":
+            reason = "outside_tolerance_after_stop"
+        result = self._mobility_feedback(
+            motion, start_steps, {"delta_m": delta_m, "duration_s": duration_s}, reason
+        )
+        result["height_error_m"] = round(height_error, 4)
+        return ToolResult(data=result)
 
 
 class RoboTwinPrimitives(ScenePrimitives):
