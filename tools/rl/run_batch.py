@@ -419,6 +419,7 @@ def collect(args: argparse.Namespace, batch: Path) -> None:
             getattr(args, "max_actions_per_call", 3),
             getattr(args, "reasoning_history", -1),
             getattr(args, "image_history", -1),
+            world_cord=args.world_cord or "base",
         )
     identity = {
         "jobs": jobs,

@@ -54,11 +54,34 @@ def primitive_definitions(primitives, *, workflow, action_mode, perception_mode)
         yield definition
 
 
-def action_batch_definition(toolkit, max_actions_per_call):
+def primitive_owner(environment: str, world_cord: str):
+    """Choose matching action declarations for local and remote toolkits."""
+    if environment == "libero":
+        return LiberoRLPrimitives
+    from robots.rl.backends import (
+        RoboCasaPrimitives,
+        RoboTwinGeneralPrimitives,
+        RoboTwinPrimitives,
+    )
+
+    return {
+        "robocasa": RoboCasaPrimitives,
+        "robotwin": RoboTwinGeneralPrimitives
+        if world_cord == "general"
+        else RoboTwinPrimitives,
+    }[environment]
+
+
+def action_batch_definition(toolkit, max_actions_per_call, environment):
     """Publish the configured bound on the single ordered action tool."""
     from robots.rl.actions import ActionBatch
 
-    declaration = ActionBatch(toolkit).execute_actions
+    batch_type = ActionBatch
+    if environment == "robotwin":
+        from robots.robotwin.rl_actions import RoboTwinActionBatch
+
+        batch_type = RoboTwinActionBatch
+    declaration = batch_type(toolkit).execute_actions
     schema = declaration.input_schema
     schema["properties"]["actions"]["maxItems"] = max_actions_per_call
     return replace(
@@ -117,6 +140,7 @@ class RLToolkit(Toolkit):
             max_actions_per_call,
             reasoning_history,
             image_history,
+            world_cord=world_cord,
         )
         from robots.rl.contracts import validate_perception_options
 
@@ -141,14 +165,7 @@ class RLToolkit(Toolkit):
         self._images_sent = 0
         self._images_lock = threading.Lock()
         self.environment, self.workflow = environment, workflow
-        primitive_type = LiberoRLPrimitives
-        if environment != "libero":
-            from robots.rl.backends import RoboCasaPrimitives, RoboTwinPrimitives
-
-            primitive_type = {
-                "robocasa": RoboCasaPrimitives,
-                "robotwin": RoboTwinPrimitives,
-            }[environment]
+        primitive_type = primitive_owner(environment, world_cord)
         native_options = dict(runtime_kwargs)
         if environment == "libero":
             native_options.update(
@@ -222,7 +239,9 @@ class RLToolkit(Toolkit):
 
             self.add_tools(iter_tools(LatestImageTools(self._primitives)))
         if action_mode == "batch":
-            self.add_tool(action_batch_definition(self, max_actions_per_call))
+            self.add_tool(
+                action_batch_definition(self, max_actions_per_call, environment)
+            )
         if self.snapshot is not None:
             self.add_tool(self.snapshot.change_query)
             if workflow == "zap_turn":

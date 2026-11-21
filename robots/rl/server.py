@@ -159,6 +159,7 @@ def main() -> None:
             def reset(self):
                 result = super().reset()
                 _release_unused_batch_planners(self._env)
+                self._finger_pad_sites = None
                 return result
 
             def plan_arm_path(self, arm, target_pose):
@@ -181,14 +182,35 @@ def main() -> None:
                 super()._register_rpc()
                 self._rpc["env.measured_grippers"] = self.measured_grippers
                 self._readonly_methods.add("env.measured_grippers")
+                self._rpc["env.coordinate_calibration"] = self.coordinate_calibration
+                self._readonly_methods.add("env.coordinate_calibration")
 
-            def measured_grippers(self):
+            def coordinate_calibration(self):
+                """Measure both Aloha mounting bases and finger geometry."""
+                from robots.robotwin.general import robotwin_calibration
+
+                sub_env = self._env._sub_env(0)
+                with sub_env.lock:
+                    calibration = robotwin_calibration(sub_env.task)
+                    self._finger_pad_sites = calibration["finger_pad_sites"]
+                    return calibration
+
+            def measured_grippers(self, with_pad: bool = False):
                 """Read physical joint positions; native gripper getters return targets."""
                 import numpy as np
+
+                from robots.robotwin.general import (
+                    measured_pad_position,
+                    robotwin_calibration,
+                )
 
                 sub_env = self._env._sub_env(0)
                 with sub_env.lock:
                     robot = sub_env.task.robot
+                    if with_pad and getattr(self, "_finger_pad_sites", None) is None:
+                        self._finger_pad_sites = robotwin_calibration(sub_env.task)[
+                            "finger_pad_sites"
+                        ]
                     result = {}
                     for side in ("left", "right"):
                         entity = getattr(robot, f"{side}_entity")
@@ -206,6 +228,10 @@ def main() -> None:
                                 getattr(robot, f"{side}_gripper_val")
                             ),
                         }
+                        if with_pad:
+                            result[side]["pad_tcp_xyz"] = measured_pad_position(
+                                robot, side, self._finger_pad_sites[side]
+                            )
                     return result
 
         facade = CleanRoboTwinFacade(

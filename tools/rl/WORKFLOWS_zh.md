@@ -188,7 +188,7 @@ LIBERO 的 `move_to(xyz?, orientation_rpy?)` 至少提供一个目标。
 `R=Rz(yaw)@Ry(pitch)@Rx(roll)`。`[pi,0,yaw]` 表示接近轴朝下，夹爪沿 site 的
 x 轴闭合。省略项保持该动作开始时的实测值。反馈包含实际 `pose.xyz`、
 `pose.orientation_rpy`、开合度及残差；`partial` 不表示到达。
-RoboCasa、RoboTwin 保持原有动作接口。
+RoboCasa 和 RoboTwin 的 base 坐标模式沿用原有动作接口。
 
 `--action-mode single` 为默认；选择 `batch` 后，独立 `move_to`、`set_gripper`
 替换成 `execute_actions`，感知工具和 `finish` 继续可用。
@@ -280,6 +280,23 @@ Qwen 通过 SGLang 运行且存在无参数工具时，使用带有界空白的�
 `--workflow episode --perception-mode batch` 将独立感知替换为 observe，
 由 source 推导依赖，独立节点并行。[CLI、示例、ID 与返回说明](OBSERVE_zh.md)。
 
+## RoboTwin 双臂共享坐标的 episode
+
+RoboTwin 的 episode 可以启用双臂共享坐标系：
+
+```bash
+bash tools/rl/run.sh --simulator robotwin --task-name click_alarmclock --seed 100000 \
+  --workflow episode --world-cord general --action-mode batch \
+  --max-actions-per-call 3 --perception-mode single --prompt simple
+```
+
+原点在两个机械臂安装基座的中点，X 向前、Y 向机器人左侧、Z 向上。控制目标和实测
+TCP 均以指垫中点为基准，位置用米，绝对姿态用固定轴 XYZ 弧度。每个动作通过 `arm`
+指定左臂或右臂。可使用 `other_xyz`、`other_orientation_rpy` 或 `other_opening`
+在同一动作内同步控制另一臂。
+`view_env`、`segment` 和 `back_project` 仍按相机和观测步数查询，返回的三维
+几何量使用共享坐标系。
+
 ## 基座坐标与纯图像控制
 
 `--world-cord base` 默认保留仿真世界坐标和现有 `grip_site`。所有 LIBERO RL workflows 都支持 `--world-cord general`：原点在安装基座中心，x 向前、y 向左、z 向上，TCP 为两指指垫中心的实测中点。初始反馈给出桌面相对基座的高度，控制器负责补偿 TCP 偏移。位置单位为米，姿态是固定轴 XYZ 欧拉角，单位为弧度。
@@ -293,4 +310,4 @@ bash tools/rl/run.sh --simulator libero --suite libero_goal --task 0 --seed 0 \
   --workflow pear --world-cord general --action-mode single --no-reasoning
 ```
 
-只运行 pear 的远程 manager 可省略 `--sam3-endpoint`，现有感知工作流仍需 SAM3 端点。RPC 两端使用相同 RPent 版本；general 必须从更新后的环境服务读取基座、桌面和指垫标定。未来双臂集成的原点约定为两个安装基座的中点，方向相同；本次只实现 LIBERO 单臂。
+只运行 pear 的远程 manager 可省略 `--sam3-endpoint`，现有感知工作流仍需 SAM3 端点。RPC 两端使用相同 RPent 版本；general 必须从更新后的环境服务读取基座、桌面和指垫标定。

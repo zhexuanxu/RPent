@@ -122,7 +122,7 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         "--world-cord",
         choices=("base", "general"),
         default="base",
-        help="base: existing simulator world; general: mounted robot-base frame and finger-pad TCP (LIBERO only).",
+        help="base: existing simulator world; general: mounted robot-base frame and finger-pad TCP (LIBERO and RoboTwin).",
     )
     parser.add_argument("--action-mode", choices=("single", "batch"), default="single")
     parser.add_argument("--max-actions-per-call", type=int, default=3)
@@ -266,6 +266,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         getattr(args, "max_actions_per_call", 3),
         getattr(args, "reasoning_history", -1),
         getattr(args, "image_history", -1),
+        world_cord=getattr(args, "world_cord", "base"),
     )
     import math
 
@@ -331,6 +332,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         getattr(args, "max_actions_per_call", 3),
         getattr(args, "reasoning_history", -1),
         getattr(args, "image_history", -1),
+        world_cord=getattr(args, "world_cord", "base"),
     )
     if environment == "libero" and not args.suite:
         raise ValueError("--suite is required")

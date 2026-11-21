@@ -96,6 +96,7 @@ def remote_options(task: dict) -> dict:
         options["max_actions_per_call"],
         options["reasoning_history"],
         options["image_history"],
+        world_cord=options["world_cord"],
     )
     validate_perception_options(
         options["workflow"],
@@ -240,7 +241,8 @@ class ToolkitWorker(RpcFacade):
             "source_digest": source_digest(),
             "tools": declarations(self.toolkit),
             "coordinates": self.toolkit._primitives.coordinates.metadata()
-            if self.toolkit.environment == "libero"
+            if self.toolkit.world_cord == "general"
+            or self.toolkit.environment == "libero"
             else None,
             "pid": os.getpid(),
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
@@ -387,17 +389,15 @@ class RemoteToolkit(Toolkit):
                     raise ValueError(
                         "remote general toolkit lacks matching base, support surface and TCP calibration"
                     )
-            from robots.rl.backends import RoboCasaPrimitives, RoboTwinPrimitives
-            from robots.rl.tools import LiberoRLPrimitives
-
-            owner = {
-                "libero": LiberoRLPrimitives,
-                "robocasa": RoboCasaPrimitives,
-                "robotwin": RoboTwinPrimitives,
-            }[request["task"]["environment"]]
             from robots.rl.contracts import coordinate_definition, strict_tool
-            from robots.rl.toolkit import action_batch_definition, primitive_definitions
+            from robots.rl.toolkit import (
+                action_batch_definition,
+                primitive_definitions,
+                primitive_owner,
+            )
 
+            environment = request["task"]["environment"]
+            owner = primitive_owner(environment, self.world_cord)
             definitions = list(
                 primitive_definitions(
                     owner,
@@ -408,7 +408,9 @@ class RemoteToolkit(Toolkit):
             )
             if self.action_mode == "batch":
                 definitions.append(
-                    action_batch_definition(self, self.max_actions_per_call)
+                    action_batch_definition(
+                        self, self.max_actions_per_call, environment
+                    )
                 )
             for definition in definitions:
                 definition = strict_tool(
