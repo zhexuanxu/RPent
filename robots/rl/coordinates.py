@@ -1,6 +1,6 @@
 # Copyright 2026 The RPent Authors.
 # Licensed under the Apache License, Version 2.0.
-"""Episode-fixed LIBERO frames; native control and depth remain in simulator world."""
+"""Episode-fixed robot frames with native control and depth in simulator world."""
 
 from __future__ import annotations
 

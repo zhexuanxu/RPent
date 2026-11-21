@@ -181,6 +181,16 @@ def main() -> None:
                 super()._register_rpc()
                 self._rpc["env.measured_grippers"] = self.measured_grippers
                 self._readonly_methods.add("env.measured_grippers")
+                self._rpc["env.coordinate_calibration"] = self.coordinate_calibration
+                self._readonly_methods.add("env.coordinate_calibration")
+
+            def coordinate_calibration(self):
+                """Measure both Aloha mounting bases and finger geometry."""
+                from robots.robotwin.general import robotwin_calibration
+
+                sub_env = self._env._sub_env(0)
+                with sub_env.lock:
+                    return robotwin_calibration(sub_env.task)
 
             def measured_grippers(self):
                 """Read physical joint positions; native gripper getters return targets."""

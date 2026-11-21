@@ -214,7 +214,7 @@ orientation in radians: `R=Rz(yaw)@Ry(pitch)@Rx(roll)`. `[pi,0,yaw]` points
 its approach axis down; the jaws close along the site's x-axis. Omitted parts
 retain the value measured at that action's start. Replies report actual
 `pose.xyz`, `pose.orientation_rpy`, opening and residual errors; `partial` is not
-arrival. RoboCasa and RoboTwin retain their native action interfaces.
+arrival. RoboCasa and RoboTwin in the base frame use their native action interfaces.
 
 `--action-mode single` is the default. `--action-mode batch` replaces standalone
 `move_to` and `set_gripper` with `execute_actions`, retaining perception and
@@ -321,6 +321,23 @@ mandatory. See https://github.com/mlc-ai/xgrammar/issues/802.
 with `observe(calls=[...])`. Sources define dependencies; independent nodes run
 concurrently. [CLI, examples, source IDs and outputs](OBSERVE.md).
 
+## RoboTwin episode with shared coordinates
+
+Run the same episode workflow with RoboTwin's shared mounting frame:
+
+```bash
+bash tools/rl/run.sh --simulator robotwin --task-name click_alarmclock --seed 100000 \
+  --workflow episode --world-cord general --action-mode batch \
+  --max-actions-per-call 3 --perception-mode single --prompt simple
+```
+
+The origin is the midpoint of the two arm mounts. X points forward, Y points robot-left,
+and Z points up. Targets and measured finger-pad TCPs use metres and absolute fixed-axis
+XYZ radians. Set `arm` to `left` or `right` on each action. Optional `other_xyz`,
+`other_orientation_rpy` or `other_opening` control the other arm in the same action.
+The standalone `view_env`, `segment` and `back_project` calls keep the recorded camera and step
+contract, and the returned geometry uses the shared frame.
+
 ## Base frame and RGB-only control
 
 `--world-cord base` is the default simulator-world frame and keeps the existing `grip_site`. `--world-cord general` works with every LIBERO RL workflow: the mounting base is the origin, x points forward, y left, z up, with a measured finger-pad midpoint TCP. Initial feedback gives table height above the base. The controller compensates the TCP offset; positions use metres and orientations fixed-axis XYZ radians.
@@ -334,4 +351,4 @@ bash tools/rl/run.sh --simulator libero --suite libero_goal --task 0 --seed 0 \
   --workflow pear --world-cord general --action-mode single --no-reasoning
 ```
 
-A pear-only remote manager can omit `--sam3-endpoint`. Existing perception workflows still require a SAM3 endpoint. Use matching RPent revisions at both RPC ends; general coordinates require native base, table and finger-pad calibration from the updated environment server. The dual-arm convention, for a future integration, places the origin midway between the two mounting bases with the same axes; only single-arm LIBERO is implemented here.
+A pear-only remote manager can omit `--sam3-endpoint`. Existing perception workflows still require a SAM3 endpoint. Use matching RPent revisions at both RPC ends; general coordinates require native base, table and finger-pad calibration from the updated environment server.

@@ -171,7 +171,14 @@ def validate_relations(name: str, arguments: dict) -> None:
 
 
 def validate_options(
-    environment, workflow, action_mode, max_actions, reasoning, images
+    environment,
+    workflow,
+    action_mode,
+    max_actions,
+    reasoning,
+    images,
+    *,
+    world_cord="base",
 ):
     """Reject unsupported non-default options before allocating a simulator."""
     if action_mode not in {"single", "batch"} or max_actions < 1:
@@ -182,13 +189,16 @@ def validate_options(
         raise ValueError("pear requires one move_to or set_gripper call per reply")
     if reasoning < -1 or images < -1:
         raise ValueError("history limits must be -1 or a nonnegative integer")
-    if (
-        environment != "libero" or workflow not in {"episode", "episode_image", "pear"}
-    ) and (
+    supports_action_options = (
+        environment == "libero"
+        and workflow in {"episode", "episode_image", "pear"}
+        or (environment, workflow, world_cord) == ("robotwin", "episode", "general")
+    )
+    if not supports_action_options and (
         action_mode != "single" or reasoning != -1 or images != -1 or max_actions != 3
     ):
         raise ValueError(
-            "action/history options currently support LIBERO episode and episode_image only"
+            "action/history options require LIBERO or RoboTwin episode with general coordinates"
         )
 
 
@@ -223,8 +233,8 @@ def validate_coordinates(environment: str, world_cord: str) -> None:
     """Reject unsupported frames before starting a simulator."""
     if world_cord not in {"base", "general"}:
         raise ValueError("world_cord must be base or general")
-    if environment != "libero" and world_cord != "base":
-        raise ValueError("general coordinates currently support LIBERO only")
+    if world_cord == "general" and environment not in {"libero", "robotwin"}:
+        raise ValueError("general coordinates currently support LIBERO and RoboTwin")
 
 
 def coordinate_definition(declaration, world_cord: str):

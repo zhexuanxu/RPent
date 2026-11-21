@@ -128,8 +128,8 @@ def system_prompt(variables: Mapping[str, object] | None = None) -> str:
         (prompts / name).read_text().strip()
         for name in (
             "shared.md",
-            "libero_general.md"
-            if environment == "libero" and general
+            f"{environment}_general.md"
+            if general and environment in {"libero", "robotwin"}
             else f"{environment}.md",
             "episode_observe.md" if perception == "batch" else f"{workflow}.md",
         )
@@ -146,7 +146,12 @@ def system_prompt(variables: Mapping[str, object] | None = None) -> str:
         sections.append(
             f"Each observe accepts at most {variables.get('max_observe_calls', 8)} suboperations. Independent operations are scheduled with concurrency at most {variables.get('observe_concurrency', 8)}."
         )
-    if environment == "libero" and workflow in {"episode", "episode_image"}:
+    if (
+        environment == "libero" or (environment == "robotwin" and general)
+    ) and workflow in {
+        "episode",
+        "episode_image",
+    }:
         if variables.get("action_mode", "single") == "batch":
             sections.append(
                 "Action interface: use execute_actions for every physical action, including single-item lists. move_to and set_gripper are not standalone tools. Maximum list length is "

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -79,6 +80,10 @@ class ActionBatch:
         Args:
             actions: Ordered list, at most the configured K; each item is move_to with xyz/orientation_rpy or set_gripper with opening. Omitted move targets keep the state measured at that item's start. Never include perception or finish tools.
         """
+        return self._execute_actions(actions)
+
+    def _execute_actions(self, actions: Sequence[BaseModel]) -> ToolResult:
+        """Run native actions using the toolkit's normal recording path."""
         tk = self.toolkit
         results, reason, stopped_at = [], None, None
         tk.workflow_stats["batch_calls"] = tk.workflow_stats.get("batch_calls", 0) + 1
