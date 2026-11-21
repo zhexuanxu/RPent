@@ -4,4 +4,4 @@ Both arms share a frame centered between their mounting bases. +X is forward, +Y
 
 For a move, specify xyz, orientation_rpy, or both. Omitted components hold the measured position or orientation. Use other_xyz and other_orientation_rpy when both arms must move synchronously. Gripper opening ranges from 0 closed to 1 open. A nonzero opening can occur on an empty gripper. Verify a grasp by checking the object after a short lift.
 
-For an unknown target, view the scene and measure the visible surface before choosing a pose. Surface points can be above or beside the center of an object. Leave clearance for the fingers, align before descending, and check the measured outcome before committing to the next phase.
+For an unknown target, view the scene and measure its visible surface before choosing a pose. Start with a position-only move to a clear hover above the target. For a top-down approach, pitch near +1.57 points the fingers down. Change orientation while clear, then descend along Z. If a move is partial, check the measured pose and use a smaller move or more clearance before retrying.
