@@ -95,20 +95,37 @@ def peek_execute_meta(payload: bytes) -> dict[str, Any]:
 def unpack_execute_response(payload: bytes) -> tuple[dict[str, Any], list[bytes]]:
     """Unpack binary execute payload into ``(meta_dict, raw_png_images)``."""
     mv = memoryview(payload)
-    if len(mv) < 8:
+    total = len(mv)
+    if total < 8:
         raise ValueError("Truncated binary execute response")
-    (meta_len,) = struct.unpack_from("!I", mv, 0)
-    pos = 4 + meta_len
-    meta = json.loads(bytes(mv[4:pos]).decode("utf-8"))
-    (n_images,) = struct.unpack_from("!I", mv, pos)
-    pos += 4
-    images: list[bytes] = []
-    for _ in range(n_images):
-        (img_len,) = struct.unpack_from("!I", mv, pos)
+    try:
+        (meta_len,) = struct.unpack_from("!I", mv, 0)
+        pos = 4 + meta_len
+        if pos + 4 > total:
+            raise ValueError(
+                f"Truncated binary execute metadata: need {pos + 4} bytes, got {total}"
+            )
+        meta = json.loads(bytes(mv[4:pos]).decode("utf-8"))
+        (n_images,) = struct.unpack_from("!I", mv, pos)
         pos += 4
-        images.append(bytes(mv[pos : pos + img_len]))
-        pos += img_len
-    return meta, images
+        images: list[bytes] = []
+        for idx in range(n_images):
+            if pos + 4 > total:
+                raise ValueError(
+                    f"Truncated binary execute image header {idx}/{n_images}"
+                )
+            (img_len,) = struct.unpack_from("!I", mv, pos)
+            pos += 4
+            if pos + img_len > total:
+                raise ValueError(
+                    f"Truncated binary execute image {idx}/{n_images}: "
+                    f"need {img_len} bytes, have {total - pos}"
+                )
+            images.append(bytes(mv[pos : pos + img_len]))
+            pos += img_len
+        return meta, images
+    except (struct.error, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Malformed binary execute response: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +396,9 @@ class _WorkerSessionHost:
         from rpent.utils.daemon import ProcessDaemon
         from rpent.utils.rpc import make_rpc_client, wait_for_endpoint, wait_for_ready
 
-        log_file = Path(tempfile.mkstemp(prefix="rpent-env-", suffix=".log")[1])
+        fd, log_path_str = tempfile.mkstemp(prefix="rpent-env-", suffix=".log")
+        os.close(fd)
+        log_file = Path(log_path_str)
         cuda = ["--cuda-device", str(self.gpu)] if self.gpu is not None else []
         daemon = ProcessDaemon(
             name=f"{self.environment}_env",
@@ -404,9 +423,14 @@ class _WorkerSessionHost:
             rpc = make_rpc_client(endpoint)
             wait_for_ready(rpc, timeout_s=60.0)
             self._daemon = daemon
+            self._daemon_log_path = log_file
             return client_factory(rpc)
         except BaseException:
             daemon.stop()
+            try:
+                log_file.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise
 
     def open(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -504,7 +528,11 @@ class _WorkerSessionHost:
                 self._robolab_runtime.close_episode()
         if self._env is not None:
             try:
-                self._env.close()
+                close_fn = getattr(self._env, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception as exc:
+                logger.warning("Ignoring env.close() error during worker cleanup: %r", exc)
             finally:
                 self._env = None
         if self._daemon is not None:
@@ -512,6 +540,13 @@ class _WorkerSessionHost:
                 self._daemon.stop()
             finally:
                 self._daemon = None
+        daemon_log = getattr(self, "_daemon_log_path", None)
+        if daemon_log is not None:
+            self._daemon_log_path = None
+            try:
+                Path(daemon_log).unlink(missing_ok=True)
+            except OSError:
+                pass
         gc.collect()
         try:
             import torch
@@ -892,18 +927,22 @@ class SimPoolManager:
         cohort_id = req.get("cohort_id")
         self._sessions[sid] = worker
         self._session_cohorts[sid] = cohort_id
+        closed_cleanly = False
         try:
             result = await worker.rpc({"op": "open", **req})
             if sid not in self._sessions or worker.replaced:
+                closed_cleanly = True
                 raise asyncio.CancelledError("Session closed during open")
             if is_disconnected is not None and await is_disconnected():
                 await self.close_session(sid)
+                closed_cleanly = True
                 raise asyncio.CancelledError("Client disconnected during open")
             return {"session_id": sid, **result}
         except asyncio.CancelledError:
             self._sessions.pop(sid, None)
             self._session_cohorts.pop(sid, None)
-            asyncio.create_task(self._replace_worker(worker))
+            if not closed_cleanly and not worker.replaced:
+                asyncio.create_task(self._replace_worker(worker))
             raise
         except Exception:
             self._sessions.pop(sid, None)
@@ -945,16 +984,12 @@ class SimPoolManager:
         worker.episodes += 1
         at_limit = 0 < self.max_episodes_per_worker <= worker.episodes
         unavailable = not worker.alive or worker.busy or worker.proc.poll() is not None
-        if (
-            worker.replaced
-            or unavailable
-            or (at_limit and self.environment != "robolab")
-        ):
+        if worker.replaced or unavailable:
             asyncio.create_task(self._replace_worker(worker))
             return {"closed": True, "recycled": True}
         try:
-            # A healthy RoboLab worker finalizes its native recorder and
-            # episode artifacts before the application is recycled.
+            # Always give healthy workers a bounded close RPC before recycling
+            # so recorders/daemons finalize cleanly instead of leaking.
             await asyncio.wait_for(worker.rpc({"op": "close"}), timeout=30.0)
             if at_limit:
                 asyncio.create_task(self._replace_worker(worker))
@@ -1198,8 +1233,19 @@ class SimPoolRouter:
                 target = int(data.get("workers_target", data.get("workers_total", 0)))
                 if target > 0:
                     self._capacity[url] = target
+                unhealthy = getattr(self, "_unhealthy", None)
+                if unhealthy is None:
+                    self._unhealthy = set()
+                if data.get("ok") and not data.get("sleeping"):
+                    self._unhealthy.discard(url)
+                else:
+                    self._unhealthy.add(url)
                 return {"url": url, **data}
             except Exception as exc:
+                unhealthy = getattr(self, "_unhealthy", None)
+                if unhealthy is None:
+                    self._unhealthy = set()
+                self._unhealthy.add(url)
                 return {
                     "url": url,
                     "ok": False,
@@ -1224,13 +1270,18 @@ class SimPoolRouter:
         }
 
     def _pick_backend(self) -> str:
+        unhealthy = getattr(self, "_unhealthy", set())
+        candidates = [u for u in self.backends if u not in unhealthy] or list(
+            self.backends
+        )
+
         def _key(url: str) -> tuple[int, float, int]:
             cap = max(self._capacity.get(url, 1), 1)
             res = self._reserved.get(url, 0)
             full = 1 if res >= cap else 0
             return (full, res / cap, res)
 
-        return min(self.backends, key=_key)
+        return min(candidates, key=_key)
 
     async def open_session(
         self, payload: dict[str, Any], *, is_disconnected=None, accept: str = ""

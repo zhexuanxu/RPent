@@ -28,8 +28,9 @@ Reproduces the exact wire format of ``QwenChatModel`` + ``WorkflowCapability`` +
   templating and prefix comparisons, and OpenAI JSON data URIs are materialized
   lazily once per message only when requested.
 - Validation retries format as ``Validation feedback:\n<msg>\n\nFix the errors and try again.``.
-- Sliding-window compaction trims by logical message count or token budget while
-  preserving tool-call/return pairs and the opening ``[system, opening_user]``.
+- Sliding-window / dynamic compaction records per-chain snapshots at every
+  compaction boundary so SFT distillation splits compacted episodes into
+  distribution-matched training chains mirroring RLinf's ``AppendOnlyHistory``.
 """
 
 from __future__ import annotations
@@ -53,6 +54,8 @@ TOOL_RESPONSE_CLOSE = "\n</tool_response>"
 IMAGE_PLACEHOLDER_PREFIX = "rpent-image://"
 PATCH_SIZE = 16
 MERGE_SIZE = 2
+MIN_IMAGE_PIXELS = 65536      # Qwen3.5 preprocessor_config.json shortest_edge
+MAX_IMAGE_PIXELS = 16777216   # Qwen3.5 preprocessor_config.json longest_edge
 DEFAULT_IMAGE_TOKENS = 1024
 
 
@@ -61,15 +64,45 @@ def file_id_for(png_bytes: bytes) -> str:
     return hashlib.sha1(png_bytes).hexdigest()[:6]
 
 
+def smart_resize_dimensions(
+    height: int,
+    width: int,
+    *,
+    factor: int = PATCH_SIZE * MERGE_SIZE,
+    min_pixels: int = MIN_IMAGE_PIXELS,
+    max_pixels: int = MAX_IMAGE_PIXELS,
+) -> tuple[int, int]:
+    """Match Qwen3.5 HF ``Qwen2VLImageProcessor`` ``smart_resize`` dimensions."""
+    if height <= 0 or width <= 0:
+        return factor, factor
+    h_bar = max(factor, round(height / factor) * factor)
+    w_bar = max(factor, round(width / factor) * factor)
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return h_bar, w_bar
+
+
+def count_image_tokens_from_size(width: int, height: int) -> int:
+    """Return exact Qwen3.5 merged visual token count for an image of ``(width, height)``."""
+    block = PATCH_SIZE * MERGE_SIZE
+    h_bar, w_bar = smart_resize_dimensions(height, width, factor=block)
+    return (h_bar // block) * (w_bar // block)
+
+
 def count_image_tokens(png_bytes: bytes) -> int:
-    """Return Qwen3.5 vision tokens for one image (32x32 merged patch grid)."""
+    """Return exact Qwen3.5 vision tokens for one image (32x32 merged patch grid)."""
     try:
         with Image.open(io.BytesIO(png_bytes)) as img:
             width, height = img.size
     except Exception:
         return DEFAULT_IMAGE_TOKENS
-    block = PATCH_SIZE * MERGE_SIZE
-    return math.ceil(width / block) * math.ceil(height / block)
+    return count_image_tokens_from_size(width, height)
 
 
 @dataclass(frozen=True)
@@ -158,14 +191,22 @@ def assistant_message(
     reasoning_content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
 ) -> LogicalMessage:
-    """Build an assistant logical message matching QwenChatModel wire layout."""
-    msg: dict[str, Any] = {"role": "assistant", "content": content or None}
-    if reasoning_content is not None:
-        msg["reasoning_content"] = reasoning_content
+    """Build an assistant logical message matching QwenChatModel & RLinf wire layout."""
+    clean_content = (
+        content.strip() if isinstance(content, str) and content.strip() else None
+    )
+    clean_reasoning = (
+        reasoning_content.strip()
+        if isinstance(reasoning_content, str) and reasoning_content.strip()
+        else None
+    )
+    msg: dict[str, Any] = {"role": "assistant", "content": clean_content}
+    if clean_reasoning is not None:
+        msg["reasoning_content"] = clean_reasoning
     call_ids: list[str] = []
     if tool_calls:
         msg["tool_calls"] = tool_calls
-        call_ids = [call["id"] for call in tool_calls]
+        call_ids = [str(call.get("id") or "") for call in tool_calls]
     return LogicalMessage(kind="assistant", wire=(msg,), tool_call_ids=tuple(call_ids))
 
 
@@ -294,13 +335,15 @@ def validate_tool_calls(
         arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must be a JSON object")
+        # Reject NaN / Infinity which Python json.loads accepts by default.
+        json.dumps(arguments, allow_nan=False)
         errors = list(Draft202012Validator(tool_schemas[name]).iter_errors(arguments))
         if errors:
             error = errors[0]
             location = ".".join(str(item) for item in error.absolute_path)
             raise ValueError(f"{location or name}: {error.message}")
         validate_relations(name, arguments)
-    except (AssertionError, ValueError, TypeError) as exc:
+    except (AssertionError, ValueError, TypeError, IndexError) as exc:
         hint = argument_hint(name, environment)
         return (
             "tool_arguments",
@@ -385,7 +428,7 @@ def _strip_message_images(msg: LogicalMessage) -> LogicalMessage:
 def _strip_message_thinking(msg: LogicalMessage) -> LogicalMessage:
     """Return a new LogicalMessage with assistant reasoning_content removed."""
     if msg.kind != "assistant" or not any(
-        item.get("reasoning_content") is not None for item in msg.wire
+        item.get("reasoning_content") for item in msg.wire
     ):
         return msg
     new_wire = tuple(
@@ -402,7 +445,7 @@ def _strip_message_thinking(msg: LogicalMessage) -> LogicalMessage:
 
 
 def find_safe_cutoff(messages: Sequence[LogicalMessage], keep_messages: int) -> int:
-    """Return earliest index >= 0 keeping at least ``keep_messages`` without splitting tool pairs."""
+    """Return earliest index >= 0 keeping at least ``keep_messages`` without splitting tool/retry pairs."""
     if keep_messages <= 0 or len(messages) <= keep_messages:
         return 0
     cutoff = len(messages) - keep_messages
@@ -410,10 +453,15 @@ def find_safe_cutoff(messages: Sequence[LogicalMessage], keep_messages: int) -> 
     for idx, msg in enumerate(messages):
         if msg.kind == "assistant":
             for cid in msg.tool_call_ids:
-                call_index[cid] = idx
+                if cid:
+                    call_index[cid] = idx
     changed = True
     while changed and cutoff > 0:
         changed = False
+        # Never leave a Validation feedback retry message orphaned at the boundary.
+        while cutoff > 0 and messages[cutoff].kind == "retry":
+            cutoff -= 1
+            changed = True
         for msg in messages[cutoff:]:
             if msg.kind == "tool":
                 for cid in msg.tool_call_ids:
@@ -429,27 +477,45 @@ def estimate_logical_tokens(
     tools: Sequence[dict[str, Any]] | None = None,
     count_text: Callable[[str], int] | None = None,
 ) -> int:
-    """Fast token estimate for standalone rollout when exact processor counting is absent."""
+    """Token estimate aligned 1-to-1 with RLinf ``EpisodeConversation.estimate_tokens``."""
     text_chunks: list[str] = []
+    chars = 0
     img_tokens = 0
+    if tools:
+        dumped_tools = json.dumps(tools, ensure_ascii=False)
+        chars += len(dumped_tools)
+        if count_text is not None:
+            text_chunks.append(dumped_tools)
     for msg in messages:
         img_tokens += msg.image_tokens
         for wire in msg.wire:
             content = wire.get("content")
             if isinstance(content, str):
-                text_chunks.append(content)
+                chars += len(content)
+                if count_text is not None:
+                    text_chunks.append(content)
             elif isinstance(content, list):
                 for part in content:
                     if part.get("type") == "text":
-                        text_chunks.append(part["text"])
-            if wire.get("reasoning_content"):
-                text_chunks.append(wire["reasoning_content"])
-            for call in wire.get("tool_calls", ()):
-                text_chunks.append(json.dumps(call, ensure_ascii=False))
-    if tools:
-        text_chunks.append(json.dumps(tools, ensure_ascii=False))
-    joined = "\n".join(text_chunks)
-    text_tokens = count_text(joined) if count_text is not None else len(joined) // 4
+                        txt = str(part.get("text", ""))
+                        chars += len(txt)
+                        if count_text is not None:
+                            text_chunks.append(txt)
+            rc = wire.get("reasoning_content")
+            if rc:
+                chars += len(rc)
+                if count_text is not None:
+                    text_chunks.append(rc)
+            if wire.get("tool_calls"):
+                dumped_tc = json.dumps(wire["tool_calls"], ensure_ascii=False)
+                chars += len(dumped_tc)
+                if count_text is not None:
+                    text_chunks.append(dumped_tc)
+    text_tokens = (
+        count_text("\n".join(text_chunks))
+        if count_text is not None
+        else math.ceil(chars / 4)
+    )
     return text_tokens + img_tokens
 
 
@@ -491,9 +557,27 @@ class EpisodeConversation:
         if not self.full_messages:
             self.full_messages = list(self.messages)
 
+        # Compaction-chain tracking (mirrors RLinf AppendOnlyHistory.chain_id).
+        # Chain 0 starts with [opening]; every compaction seals the prior chain
+        # (if it generated >=1 assistant turn) and begins a new chain whose
+        # carried-over prefix is masked (loss=False) during SFT export.
+        self._completed_chains: list[dict[str, Any]] = []
+        self._chain_prefix_logical_count: int = len(self.messages)
+        self._chain_compaction_event_idx: int | None = None
+        self._chain_turn_indices: list[int] = []
+        self._total_assistant_turns: int = 0
+
     def images(self) -> list[bytes]:
         """Return all raw binary PNG images across active messages in order."""
         return [img for msg in self.messages for img in msg.images]
+
+    def total_image_tokens(self) -> int:
+        return sum(msg.image_tokens for msg in self.messages)
+
+    def estimate_tokens(
+        self, count_text: Callable[[str], int] | None = None
+    ) -> int:
+        return estimate_logical_tokens(self.messages, self.tools, count_text)
 
     def all_images_by_id(self) -> dict[str, bytes]:
         """Return deduplicated ``{file_id: png_bytes}`` across lossless ``full_messages``."""
@@ -530,6 +614,46 @@ class EpisodeConversation:
     def full_wire_messages(self, *, inline_base64: bool = False) -> list[dict[str, Any]]:
         """Flatten lossless uncompacted logical messages into template dicts."""
         return self._wire_from(self.full_messages, inline_base64=inline_base64)
+
+    def _snapshot_chain(
+        self,
+        logical_messages: Sequence[LogicalMessage],
+        *,
+        chain_id: int,
+        compaction_event_index: int | None,
+        prefix_logical_count: int,
+        turn_indices: Sequence[int],
+        compaction_triggered_after: bool,
+    ) -> dict[str, Any]:
+        clamped_prefix = min(prefix_logical_count, len(logical_messages))
+        prefix_wire_count = sum(
+            len(msg.wire) for msg in logical_messages[:clamped_prefix]
+        )
+        return {
+            "chain_id": chain_id,
+            "compaction_event_index": compaction_event_index,
+            "prefix_logical_count": clamped_prefix,
+            "prefix_wire_count": prefix_wire_count,
+            "turn_indices": list(turn_indices),
+            "compaction_triggered_after": compaction_triggered_after,
+            "messages": self._wire_from(logical_messages, inline_base64=False),
+        }
+
+    def export_chains(self) -> list[dict[str, Any]]:
+        """Return ordered compaction-split chain snapshots for SFT export."""
+        chains = list(self._completed_chains)
+        if self._chain_turn_indices or not chains:
+            chains.append(
+                self._snapshot_chain(
+                    self.messages,
+                    chain_id=len(chains),
+                    compaction_event_index=self._chain_compaction_event_idx,
+                    prefix_logical_count=self._chain_prefix_logical_count,
+                    turn_indices=self._chain_turn_indices,
+                    compaction_triggered_after=False,
+                )
+            )
+        return chains
 
     def _compact_base(self, cfg: CompactionConfig) -> bool:
         cutoff = find_safe_cutoff(self.messages, cfg.keep_messages)
@@ -571,7 +695,7 @@ class EpisodeConversation:
             i
             for i in range(1, len(self.messages))
             if self.messages[i].kind == "assistant"
-            and any(w.get("reasoning_content") is not None for w in self.messages[i].wire)
+            and any(bool(w.get("reasoning_content")) for w in self.messages[i].wire)
         ]
         keep_think = max(0, cfg.keep_recent_thinking)
         drop_think_set = (
@@ -635,8 +759,9 @@ class EpisodeConversation:
         if not (over_messages or over_tokens):
             return False
 
-        before_len = len(self.messages)
-        before_images = sum(len(m.images) for m in self.messages)
+        pre_compact_msgs = list(self.messages)
+        before_len = len(pre_compact_msgs)
+        before_images = sum(len(m.images) for m in pre_compact_msgs)
         if cfg.strategy == "dynamic":
             compacted = self._compact_dynamic(
                 cfg,
@@ -647,9 +772,28 @@ class EpisodeConversation:
         else:
             compacted = self._compact_base(cfg)
         if compacted:
+            event_idx = len(self.compaction_events)
+            # Seal the pre-compaction chain if it contains at least one generated turn;
+            # consecutive compactions with 0 turns in between collapse into the same prefix.
+            if self._chain_turn_indices:
+                self._completed_chains.append(
+                    self._snapshot_chain(
+                        pre_compact_msgs,
+                        chain_id=len(self._completed_chains),
+                        compaction_event_index=self._chain_compaction_event_idx,
+                        prefix_logical_count=self._chain_prefix_logical_count,
+                        turn_indices=self._chain_turn_indices,
+                        compaction_triggered_after=True,
+                    )
+                )
+            self._chain_prefix_logical_count = len(self.messages)
+            self._chain_compaction_event_idx = event_idx
+            self._chain_turn_indices = []
             self.compaction_events.append(
                 {
+                    "event_index": event_idx,
                     "strategy": cfg.strategy,
+                    "trigger_tokens": current_tokens,
                     "logical_messages_before": before_len,
                     "logical_messages_after": len(self.messages),
                     "images_before": before_images,
@@ -673,6 +817,8 @@ class EpisodeConversation:
         )
         self.messages.append(msg)
         self.full_messages.append(msg)
+        self._chain_turn_indices.append(self._total_assistant_turns)
+        self._total_assistant_turns += 1
 
     def append_tool_result(
         self,

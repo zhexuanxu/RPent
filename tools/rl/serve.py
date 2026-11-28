@@ -45,7 +45,13 @@ def _spawn(
     env = os.environ.copy()
     if env_overrides:
         env.update(env_overrides)
-    fh = (log_dir / f"{name}.log").open("wb")
+    fh = (log_dir / f"{name}.log").open("ab")
+    fh.write(
+        f"\n===== [rpent_serve] starting {name} at {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n".encode(
+            "utf-8"
+        )
+    )
+    fh.flush()
     proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env)
     fh.close()
     logger.info("Started %s (pid=%d): %s", name, proc.pid, " ".join(cmd))
@@ -93,7 +99,7 @@ def main() -> None:
     common_env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
     procs: list[tuple[str, subprocess.Popen]] = []
 
-    def _shutdown(*_args) -> None:
+    def _shutdown(exit_code: int = 0) -> None:
         logger.info("Stopping all %d RPent services...", len(procs))
         for _name, p in reversed(procs):
             if p.poll() is None:
@@ -105,10 +111,10 @@ def main() -> None:
                     p.wait(timeout=max(0.1, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
                     p.kill()
-        sys.exit(0)
+        sys.exit(exit_code)
 
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, lambda *_: _shutdown(0))
+    signal.signal(signal.SIGTERM, lambda *_: _shutdown(0))
 
     try:
         # 1. Start local SAM3 backends + Sam3Pool (optional for sim-only nodes)
@@ -283,17 +289,40 @@ def main() -> None:
             logger.info("Simulator router %s ready at %s: %s", router_name, url, status)
 
         logger.info("ALL SERVICES READY. Monitoring child processes...")
+        restart_history: dict[str, list[float]] = {}
+        max_restarts_window = 10
+        window_s = 1800.0
         while True:
             for idx, (name, proc) in enumerate(list(procs)):
                 code = proc.poll()
                 if code is not None:
                     if name in sim_specs:
+                        now = time.monotonic()
+                        hist = [
+                            ts
+                            for ts in restart_history.get(name, [])
+                            if now - ts < window_s
+                        ]
+                        if len(hist) >= max_restarts_window:
+                            raise RuntimeError(
+                                f"Simulator pool {name} crashed {len(hist)} times within "
+                                f"{int(window_s)}s (last exit code {code}); aborting crash loop"
+                            )
+                        backoff_s = min(60.0, 2.0 * (2 ** min(len(hist), 5)))
+                        hist.append(now)
+                        restart_history[name] = hist
                         cmd, sim_env, url = sim_specs[name]
                         logger.error(
-                            "Simulator pool %s exited with code %s; restarting it without tearing down healthy pools",
+                            "Simulator pool %s exited with code %s; restarting in %.1fs "
+                            "(attempt %d/%d in %ds window) without tearing down healthy pools",
                             name,
                             code,
+                            backoff_s,
+                            len(hist),
+                            max_restarts_window,
+                            int(window_s),
                         )
+                        time.sleep(backoff_s)
                         new_proc = _spawn(name, cmd, log_dir, sim_env)
                         procs[idx] = (name, new_proc)
                         try:
@@ -308,7 +337,7 @@ def main() -> None:
             time.sleep(2.0)
     except Exception:
         logger.exception("Service supervisor failed; shutting down")
-        _shutdown()
+        _shutdown(1)
 
 
 if __name__ == "__main__":

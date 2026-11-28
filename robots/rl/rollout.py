@@ -14,24 +14,22 @@
 
 """Standalone async rollout, evaluation, and resumable SFT trajectory collector.
 
-Uses the exact same Harness v2 ``EpisodeConversation`` (step-0 opening images,
-compact feedback, optional ``jaw_mm``, ``execute_actions(..., observe=...)``,
-and ``base``/``dynamic`` compaction) and tool-validation loop as RLinf training
-so standalone evaluation and SFT distillation stay 100% aligned with RL.
-
-Key SFT collection capabilities:
-- Per-episode atomic persistence (``episodes/<episode_key>/trajectory.json`` +
-  deduplicated ``images/<fid>.png`` + append-only ``manifest.jsonl``) so runs
-  can be interrupted and resumed via ``--resume`` with zero lost work.
-- Sticky least-loaded multi-endpoint routing across SGLang continuous-batching
-  replicas (``--model-url url1,url2,...`` or ``--model-urls-file``) to maximize
-  RadixCache hits and GPU batch saturation.
-- Provider-aware OpenAI-compatible client supporting both local SGLang models
-  (e.g. ``Qwen3.8-27B``) and remote APIs (e.g. ``deepseek-v4.1-flash``) with
-  exponential backoff on HTTP 429/5xx/timeouts.
-- Intra-task sharding (``--shard i/N``) and round-robin task interleaving
-  (``--interleave-tasks``) so multiple teachers cover 100% of tasks without
-  seed overlap.
+Aligned 1-to-1 with RLinf Harness v2 RL rollout (``RPentAgentLoopWorker``):
+- Identical ``EpisodeConversation`` wire format, step-0 opening images,
+  ``jaw_mm`` feedback, ``execute_actions(..., observe=...)``, deterministic
+  ``call_{turn_idx}_{idx}`` IDs, and ``base``/``dynamic`` context compaction.
+- Exact 2-stage compaction triggering (pre-turn budget trigger at 48,000 +
+  hard ``context_window - max_tokens`` guard with at most 1 forced compaction
+  and strict ``context_length_exceeded`` termination, never clamping
+  ``max_tokens``). Optional ``--compaction-tokenizer`` counts exact target
+  student (Qwen3.5) text + visual tokens even when collecting from non-Qwen
+  teachers such as DeepSeek.
+- Compaction-chain snapshots saved in ``trajectory.json`` (``schema_version: 3``)
+  so ``robots.rl.sft_export`` splits compacted episodes into independent
+  distribution-matched training chains mirroring RLinf's ``AppendOnlyHistory``.
+- Never retries non-idempotent simulator ``/execute`` calls mid-episode and
+  never persists ``infrastructure_error`` episodes as completed trajectories;
+  infra failures log to ``infra_errors.jsonl`` so ``--resume`` cleanly retries.
 """
 
 from __future__ import annotations
@@ -47,6 +45,7 @@ import os
 from pathlib import Path
 import random
 import re
+import threading
 import time
 from typing import Any, Literal
 
@@ -63,8 +62,16 @@ from rpent.utils.logging import get_logger
 logger = get_logger("rl_rollout")
 
 RETRYABLE_LLM_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
-RETRYABLE_SIM_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+FAILOVER_LLM_STATUS = frozenset({500, 502, 503, 504})
 ProviderMode = Literal["auto", "sglang", "openai"]
+
+
+class InfraEpisodeError(RuntimeError):
+    """Typed infrastructure failure that aborts the episode without saving it."""
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 def parse_model_urls(
@@ -112,17 +119,26 @@ def split_inline_thinking(
     content: str | None, reasoning_content: str | None
 ) -> tuple[str | None, str | None]:
     """Extract inline ``<think>...</think>`` when a server omits ``reasoning_content``."""
-    if reasoning_content is not None or not isinstance(content, str):
-        return content, reasoning_content
+    clean_rc = (
+        reasoning_content.strip()
+        if isinstance(reasoning_content, str) and reasoning_content.strip()
+        else None
+    )
+    if clean_rc is not None:
+        clean_c = content.strip() if isinstance(content, str) and content.strip() else None
+        return clean_c, clean_rc
+    if not isinstance(content, str):
+        return None, None
     if "</think>" not in content:
-        return content, None
+        clean_c = content.strip() or None
+        return clean_c, None
     before, _, after = content.partition("</think>")
     if "<think>" in before:
         reasoning = before.rsplit("<think>", 1)[-1].strip()
     else:
         reasoning = before.strip()
-    rest = after.lstrip("\n")
-    return (rest or None), reasoning
+    rest = after.strip()
+    return (rest or None), (reasoning or None)
 
 
 def sanitize_episode_key(raw: str) -> str:
@@ -132,10 +148,15 @@ def sanitize_episode_key(raw: str) -> str:
 
 
 def _task_group_key(task: dict[str, Any], query_id: str) -> str:
+    suite = task.get("suite")
+    suite_prefix = f"{str(suite).strip()}::" if suite is not None and str(suite).strip() else ""
     for field in ("task_name", "task_id", "bddl_file_name", "task"):
         val = task.get(field)
         if val is not None and str(val).strip():
-            return str(val)
+            base = str(val).strip()
+            if suite_prefix and not base.startswith(suite_prefix):
+                return f"{suite_prefix}{base}"
+            return base
     return query_id
 
 
@@ -164,12 +185,12 @@ def build_episode_schedule(
     limit: int | None = None,
     pass_offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """Build deterministic episode assignments with intra-task sharding and interleaving.
+    """Build deterministic episode assignments with strictly disjoint intra-task sharding.
 
     Sharding is applied *inside* each task group before round-robin interleaving
-    so every shard covers 100% of tasks with disjoint seeds/init states. When
-    ``target_count`` exceeds the shard length, additional passes (``r1``, ``r2``,
-    ...) cycle cleanly with distinct ``episode_key`` values.
+    so shards never collide on the same seed/init state. When ``target_count``
+    exceeds the shard length, additional passes (``r1``, ``r2``, ...) cycle
+    cleanly with distinct ``episode_key`` values.
     """
     parsed: list[dict[str, Any]] = []
     for idx, row in enumerate(rows):
@@ -201,8 +222,6 @@ def build_episode_schedule(
     for gname, items in groups.items():
         if num_shards > 1:
             subset = items[shard_index::num_shards]
-            if not subset and items:
-                subset = [items[shard_index % len(items)]]
         else:
             subset = list(items)
         if subset:
@@ -261,11 +280,81 @@ class EndpointPool:
         if url in self._inflight:
             self._inflight[url] = max(0, self._inflight[url] - 1)
 
+    def failover(self, current_url: str) -> str:
+        """Atomically move one in-flight slot from ``current_url`` to a least-loaded peer."""
+        others = [u for u in self.urls if u != current_url]
+        if not others:
+            return current_url
+        min_load = min(self._inflight[u] for u in others)
+        candidates = [u for u in others if self._inflight[u] == min_load]
+        next_url = random.choice(candidates) if len(candidates) > 1 else candidates[0]
+        self.release(current_url)
+        self._inflight[next_url] += 1
+        return next_url
+
     def alternate(self, exclude_url: str) -> str:
         others = [u for u in self.urls if u != exclude_url]
         if not others:
             return exclude_url
-        return min(others, key=lambda u: self._inflight[u])
+        min_load = min(self._inflight[u] for u in others)
+        candidates = [u for u in others if self._inflight[u] == min_load]
+        return random.choice(candidates) if len(candidates) > 1 else candidates[0]
+
+
+def _normalize_for_hf_template(raw: dict[str, Any]) -> dict[str, Any]:
+    """Mirror RLinf ``history._normalize_message`` for exact Qwen3.5 token counting."""
+    msg = dict(raw)
+    if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
+        msg.pop("reasoning_content", None)
+    if msg.get("content") is None:
+        msg["content"] = ""
+    if isinstance(msg["content"], list) or not msg.get("tool_calls"):
+        return msg
+    calls, malformed = [], []
+    for call in msg["tool_calls"]:
+        fn = call.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                pass
+        if isinstance(args, dict):
+            calls.append({**call, "function": {**fn, "arguments": args}})
+        else:
+            malformed.append(json.dumps(call, ensure_ascii=False))
+    if malformed:
+        msg["content"] = msg["content"] + "\n" + "\n".join(malformed)
+    msg["tool_calls"] = calls
+    return msg
+
+
+class CompactionTokenCounter:
+    """Exact Qwen3.5 multimodal prompt token counter (text + smart_resize vision tokens)."""
+
+    def __init__(self, tokenizer_path: Path) -> None:
+        from transformers import AutoTokenizer
+
+        self.tokenizer_path = Path(tokenizer_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            str(self.tokenizer_path), trust_remote_code=True
+        )
+        self._lock = threading.Lock()
+
+    def count_prompt_tokens(self, conv: EpisodeConversation) -> int:
+        wire_msgs = [_normalize_for_hf_template(m) for m in conv.wire_messages(inline_base64=False)]
+        with self._lock:
+            text = self._tokenizer.apply_chat_template(
+                wire_msgs,
+                tools=conv.tools,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            text_ids = self._tokenizer(text, add_special_tokens=False)["input_ids"]
+        # Each <|image_pad|> placeholder occupies 1 token in text_ids and expands to
+        # msg.image_tokens merged visual tokens in SGLang/HF Qwen3VLProcessor.
+        num_images = len(conv.images())
+        return len(text_ids) + conv.total_image_tokens() - num_images
 
 
 def _retry_delay_s(attempt: int, retry_after: str | None = None) -> float:
@@ -301,7 +390,7 @@ def _save_episode_atomic(
     rollout_config: dict[str, Any],
     usage_totals: dict[str, int],
 ) -> Path:
-    """Persist deduplicated PNGs + atomic ``trajectory.json`` and ``outcome.json``."""
+    """Persist deduplicated PNGs + atomic ``trajectory.json`` (v3 with chains) and ``outcome.json``."""
     ep_dir.mkdir(parents=True, exist_ok=True)
     img_dir = ep_dir / "images"
     images_by_id = conv.all_images_by_id()
@@ -311,13 +400,14 @@ def _save_episode_atomic(
         for fid, png_bytes in images_by_id.items():
             img_path = img_dir / f"{fid}.png"
             if not img_path.exists():
-                tmp_img = img_dir / f".{fid}.png.tmp.{os.getpid()}"
+                tmp_img = img_dir / f".{fid}.png.tmp.{os.getpid()}.{time.monotonic_ns()}"
                 tmp_img.write_bytes(png_bytes)
                 os.replace(tmp_img, img_path)
             image_relpaths[fid] = f"images/{fid}.png"
 
+    chains = conv.export_chains()
     trajectory = {
-        "schema_version": 2,
+        "schema_version": 3,
         "episode_key": episode_key,
         "query_id": query_id,
         "pass_idx": pass_idx,
@@ -334,6 +424,7 @@ def _save_episode_atomic(
         "tools": conv.tools,
         "images": image_relpaths,
         "compaction_events": conv.compaction_events,
+        "chains": chains,
         "full_messages": conv.full_wire_messages(inline_base64=False),
         "compacted_messages": conv.wire_messages(inline_base64=False),
     }
@@ -343,9 +434,12 @@ def _save_episode_atomic(
     return traj_path
 
 
-def _load_completed_episodes(output_dir: Path) -> dict[str, dict[str, Any]]:
-    """Scan ``manifest.jsonl`` and ``episodes/*/trajectory.json`` for ``--resume``."""
+def _load_completed_episodes(
+    output_dir: Path, *, save_trajectory: bool = True
+) -> dict[str, dict[str, Any]]:
+    """Scan ``manifest.jsonl`` and episode files for ``--resume``."""
     completed: dict[str, dict[str, Any]] = {}
+    marker_name = "trajectory.json" if save_trajectory else "outcome.json"
     manifest = output_dir / "manifest.jsonl"
     if manifest.exists():
         for line in manifest.read_text(encoding="utf-8").splitlines():
@@ -355,31 +449,36 @@ def _load_completed_episodes(output_dir: Path) -> dict[str, dict[str, Any]]:
                 rec = json.loads(line)
                 key = rec.get("episode_key")
                 if key:
-                    traj_path = output_dir / "episodes" / key / "trajectory.json"
-                    if traj_path.exists():
+                    marker_path = output_dir / "episodes" / key / marker_name
+                    if marker_path.exists():
                         completed[str(key)] = rec
             except json.JSONDecodeError:
                 continue
 
     episodes_root = output_dir / "episodes"
     if episodes_root.is_dir():
-        for traj_path in episodes_root.glob("*/trajectory.json"):
-            key = traj_path.parent.name
+        for marker_path in episodes_root.glob(f"*/{marker_name}"):
+            key = marker_path.parent.name
             if key in completed:
                 continue
             try:
-                data = json.loads(traj_path.read_text(encoding="utf-8"))
-                out = data.get("outcome") or {}
+                data = json.loads(marker_path.read_text(encoding="utf-8"))
+                out = data.get("outcome") if save_trajectory else data
+                out = out or {}
                 completed[key] = {
                     "episode_key": key,
-                    "query_id": data.get("query_id"),
-                    "environment": data.get("environment"),
+                    "query_id": data.get("query_id") or out.get("query_id"),
+                    "environment": data.get("environment") or out.get("environment"),
                     "success": bool(out.get("success", False)),
                     "turns": int(out.get("turns", 0)),
                     "termination_reason": out.get("termination_reason"),
                     "error_kind": out.get("error_kind"),
                     "elapsed_s": out.get("elapsed_s", 0.0),
-                    "trajectory_path": str(traj_path.relative_to(output_dir)),
+                    "trajectory_path": (
+                        str(marker_path.relative_to(output_dir))
+                        if save_trajectory
+                        else None
+                    ),
                 }
             except Exception:
                 continue
@@ -411,6 +510,7 @@ def _parse_context_length_error(body: str) -> ContextLengthExceededError | None:
             "exceeds the model",
             "too many tokens",
             "prompt is too long",
+            "input length",
         )
     ):
         return None
@@ -436,7 +536,7 @@ async def _post_llm_with_retry(
     headers: dict[str, str],
     max_retries: int,
 ) -> tuple[dict[str, Any], str]:
-    """Call ``/chat/completions`` with exponential backoff on 429/5xx/network errors."""
+    """Call ``/chat/completions`` with exponential backoff and multi-replica failover."""
     active_url = model_url.rstrip("/")
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
@@ -446,6 +546,20 @@ async def _post_llm_with_retry(
             )
             if resp.status_code in RETRYABLE_LLM_STATUS and attempt < max_retries:
                 delay = _retry_delay_s(attempt, resp.headers.get("Retry-After"))
+                if (
+                    resp.status_code in FAILOVER_LLM_STATUS
+                    and endpoint_pool is not None
+                    and len(endpoint_pool.urls) > 1
+                ):
+                    next_url = endpoint_pool.failover(active_url)
+                    if next_url != active_url:
+                        logger.warning(
+                            "LLM HTTP %d on %s; failing over to %s",
+                            resp.status_code,
+                            active_url,
+                            next_url,
+                        )
+                        active_url = next_url
                 logger.warning(
                     "LLM HTTP %d from %s (attempt %d/%d); retrying in %.1fs",
                     resp.status_code,
@@ -476,7 +590,7 @@ async def _post_llm_with_retry(
                 break
             delay = _retry_delay_s(attempt)
             if endpoint_pool is not None and attempt >= 1 and len(endpoint_pool.urls) > 1:
-                next_url = endpoint_pool.alternate(active_url)
+                next_url = endpoint_pool.failover(active_url)
                 if next_url != active_url:
                     logger.warning(
                         "LLM transport error on %s (%s); failing over to %s",
@@ -499,6 +613,32 @@ async def _post_llm_with_retry(
     raise last_exc
 
 
+def _normalize_tool_calls_for_turn(
+    raw_tool_calls: Sequence[dict[str, Any]], turn_idx: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize tool calls to deterministic ``call_{turn_idx}_{idx}`` IDs (RLinf parity)."""
+    wire_calls: list[dict[str, Any]] = []
+    parsed_calls: list[dict[str, Any]] = []
+    for idx, tc in enumerate(raw_tool_calls):
+        cid = f"call_{turn_idx}_{idx}"
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not isinstance(fn, dict):
+            name = ""
+            arguments: Any = ""
+        else:
+            name = str(fn.get("name") or "")
+            arguments = fn.get("arguments", "")
+        wire_calls.append(
+            {
+                "id": cid,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+        )
+        parsed_calls.append({"id": cid, "name": name, "arguments": arguments})
+    return wire_calls, parsed_calls
+
+
 async def run_episode(
     *,
     model_url: str,
@@ -507,11 +647,15 @@ async def run_episode(
     task: dict[str, Any],
     max_turns: int = 50,
     max_tokens: int = 16384,
+    context_window: int = 65536,
+    max_episode_steps: int = 10000,
     temperature: float = 1.0,
     top_p: float = 0.95,
     top_k: int = 20,
     thinking: bool = True,
+    reasoning_effort: str | None = None,
     compaction: CompactionConfig | None = None,
+    token_counter: CompactionTokenCounter | None = None,
     image_size: int | None = None,
     max_actions_per_call: int = 3,
     include_jaw_mm: bool = True,
@@ -528,8 +672,12 @@ async def run_episode(
     pass_idx: int = 0,
     client: httpx.AsyncClient | None = None,
     endpoint_pool: EndpointPool | None = None,
-) -> dict[str, Any]:
-    """Run one standalone Harness v2 episode and optionally save ``trajectory.json``."""
+) -> tuple[dict[str, Any], str]:
+    """Run one standalone Harness v2 episode aligned 1-to-1 with RLinf.
+
+    Returns ``(outcome_dict, final_model_url)`` so callers release the active
+    endpoint slot accurately after any failover.
+    """
     started = time.perf_counter()
     resolved_provider = detect_provider(
         provider,
@@ -549,6 +697,7 @@ async def run_episode(
             limits=httpx.Limits(keepalive_expiry=30.0),
         )
 
+    active_model_url = model_url.rstrip("/")
     try:
         base_seed = task.get("seed", task.get("init_state_id"))
         seeds = [base_seed, *(task.get("fallback_seeds") or ())]
@@ -568,6 +717,7 @@ async def run_episode(
                         f"{sim_url.rstrip('/')}/sessions/open",
                         json={
                             "task": attempt_task,
+                            "max_episode_steps": max_episode_steps,
                             "image_size": image_size,
                             "max_actions_per_call": max_actions_per_call,
                             "reasoning": thinking,
@@ -595,7 +745,7 @@ async def run_episode(
                             for b64 in opened.get("images_b64") or ()
                         ]
                     break
-                except (httpx.HTTPError, OSError) as exc:
+                except (httpx.HTTPError, OSError, ValueError) as exc:
                     last_exc = exc
             if opened is not None:
                 break
@@ -603,8 +753,9 @@ async def run_episode(
                 await asyncio.sleep(_retry_delay_s(infra_attempt))
 
         if opened is None:
-            assert last_exc is not None
-            raise last_exc
+            raise InfraEpisodeError(
+                f"SimPoolServer open failed: {last_exc}", kind="env_setup"
+            ) from last_exc
         sid = opened["session_id"]
 
         conv = EpisodeConversation(
@@ -631,37 +782,65 @@ async def run_episode(
         }
         last_turn_tokens: int | None = None
         last_msg_count = len(conv.messages)
-        active_model_url = model_url.rstrip("/")
+
+        async def _measure_prompt_tokens() -> int | None:
+            if token_counter is not None:
+                return await asyncio.to_thread(token_counter.count_prompt_tokens, conv)
+            if last_turn_tokens is not None:
+                delta_msgs = conv.messages[last_msg_count:]
+                return last_turn_tokens + estimate_logical_tokens(delta_msgs)
+            return None
 
         try:
             while not done and turns < max_turns:
-                est_current_tokens: int | None = None
-                if last_turn_tokens is not None:
-                    delta_msgs = conv.messages[last_msg_count:]
-                    est_current_tokens = last_turn_tokens + estimate_logical_tokens(
-                        delta_msgs
-                    )
+                # Stage 1: Proactive compaction aligned with RLinf token trigger.
+                est_current_tokens = await _measure_prompt_tokens()
                 if conv.maybe_compact(current_tokens=est_current_tokens):
                     last_turn_tokens = None
 
-                turn_max_tokens = max_tokens
+                # Stage 2: Exact RLinf budget guard (seq_limit - prompt_len >= max_tokens).
+                # Allows at most 1 forced compaction; never clamps max_tokens.
                 resp_json: dict[str, Any] | None = None
-                for ctx_attempt in range(3):
+                for overflow_attempt in range(2):
+                    prompt_tokens = await _measure_prompt_tokens()
+                    if prompt_tokens is None and token_counter is None:
+                        prompt_tokens = conv.estimate_tokens()
+                    if (
+                        prompt_tokens is not None
+                        and context_window - prompt_tokens < max_tokens
+                    ):
+                        if overflow_attempt == 0 and conv.maybe_compact(
+                            current_tokens=max(prompt_tokens, context_window)
+                        ):
+                            last_turn_tokens = None
+                            continue
+                        error_kind = "context_length_exceeded"
+                        reason = "context_length_exceeded"
+                        error_msg = (
+                            f"Prompt tokens ({prompt_tokens}) leave less than "
+                            f"max_tokens={max_tokens} in context_window={context_window}"
+                        )
+                        resp_json = None
+                        break
+
                     payload: dict[str, Any] = {
                         "model": model_name,
                         "messages": conv.wire_messages(inline_base64=True),
                         "tools": conv.tools,
                         "parallel_tool_calls": False,
-                        "max_tokens": turn_max_tokens,
+                        "max_tokens": max_tokens,
                         "temperature": temperature,
                         "top_p": top_p,
                     }
                     if resolved_provider == "sglang":
                         payload["top_k"] = top_k
-                        payload["chat_template_kwargs"] = {
+                        chat_kwargs: dict[str, Any] = {
                             "enable_thinking": thinking,
                             "preserve_thinking": True,
                         }
+                        if reasoning_effort is not None:
+                            chat_kwargs["reasoning_effort"] = reasoning_effort
+                        payload["chat_template_kwargs"] = chat_kwargs
                     try:
                         resp_json, active_model_url = await _post_llm_with_retry(
                             client,
@@ -673,92 +852,77 @@ async def run_episode(
                         )
                         break
                     except ContextLengthExceededError as ctx_exc:
-                        forced_tokens = (
-                            ctx_exc.input_tokens
-                            if ctx_exc.input_tokens is not None
-                            else 10**9
+                        forced_tokens = max(
+                            ctx_exc.input_tokens or context_window,
+                            context_window,
                         )
-                        compacted = conv.maybe_compact(
-                            current_tokens=max(forced_tokens, 10**9)
-                        )
-                        last_turn_tokens = None
-                        if compacted and ctx_attempt < 2:
+                        if overflow_attempt == 0 and conv.maybe_compact(
+                            current_tokens=forced_tokens
+                        ):
+                            last_turn_tokens = None
                             logger.info(
                                 "Context length exceeded on %s (in=%s max=%s); "
-                                "forced compaction and retrying turn %d",
+                                "forced 1 compaction and retrying turn %d",
                                 episode_key or sid,
                                 ctx_exc.input_tokens,
                                 ctx_exc.max_context_tokens,
                                 turns + 1,
                             )
                             continue
-                        if (
-                            ctx_exc.input_tokens is not None
-                            and ctx_exc.max_context_tokens is not None
-                            and ctx_attempt < 2
-                        ):
-                            headroom = (
-                                ctx_exc.max_context_tokens - ctx_exc.input_tokens - 128
-                            )
-                            if headroom >= 1024 and headroom < turn_max_tokens:
-                                logger.info(
-                                    "Clamping max_tokens %d -> %d on %s to fit %d context",
-                                    turn_max_tokens,
-                                    headroom,
-                                    episode_key or sid,
-                                    ctx_exc.max_context_tokens,
-                                )
-                                turn_max_tokens = headroom
-                                continue
-                        error_kind, reason = "context_limit", "context_limit"
+                        error_kind = "context_length_exceeded"
+                        reason = "context_length_exceeded"
                         error_msg = str(ctx_exc)
                         resp_json = None
                         break
 
                 if resp_json is None:
                     break
+
                 usage = resp_json.get("usage") or {}
                 prompt_toks = int(usage.get("prompt_tokens") or 0)
                 comp_toks = int(usage.get("completion_tokens") or 0)
                 usage_totals["prompt_tokens"] += prompt_toks
                 usage_totals["completion_tokens"] += comp_toks
                 prompt_details = usage.get("prompt_tokens_details") or {}
-                usage_totals["cached_tokens"] += int(
-                    prompt_details.get("cached_tokens") or 0
+                cached_toks = int(
+                    prompt_details.get("cached_tokens")
+                    or usage.get("prompt_cache_hit_tokens")
+                    or 0
                 )
+                usage_totals["cached_tokens"] += cached_toks
                 if prompt_toks > 0:
                     last_turn_tokens = prompt_toks + comp_toks
                     last_msg_count = len(conv.messages) + 1
 
+                turn_idx = turns  # 0-based, matching RLinf agent_loop.py:263
                 choice = resp_json["choices"][0]
                 turns += 1
                 msg = choice["message"]
                 finish = choice.get("finish_reason")
-                tool_calls = msg.get("tool_calls") or []
+                raw_tool_calls = msg.get("tool_calls") or []
+                wire_tool_calls, parsed_calls = _normalize_tool_calls_for_turn(
+                    raw_tool_calls, turn_idx
+                )
                 clean_content, clean_reasoning = split_inline_thinking(
                     msg.get("content"), msg.get("reasoning_content")
                 )
                 conv.append_assistant(
                     content=clean_content,
                     reasoning_content=clean_reasoning,
-                    tool_calls=tool_calls or None,
+                    tool_calls=wire_tool_calls or None,
                 )
                 if finish == "length":
                     error_kind, reason = "response_truncated", "response_truncated"
                     error_msg = "Token limit reached before completing response"
                     break
-                if not tool_calls:
+                if finish not in {None, "stop", "tool_calls", "function_call"}:
+                    error_kind, reason = str(finish), str(finish)
+                    error_msg = f"Abnormal finish_reason={finish!r}"
+                    break
+                if not parsed_calls:
                     reason = "planner_completed"
                     break
 
-                parsed_calls = [
-                    {
-                        "id": tc.get("id") or f"call_{turns}_{idx}",
-                        "name": tc["function"]["name"],
-                        "arguments": tc["function"]["arguments"],
-                    }
-                    for idx, tc in enumerate(tool_calls)
-                ]
                 err_kind, err_msg, args, should_retry = conv.validate_or_retry(
                     parsed_calls
                 )
@@ -768,39 +932,37 @@ async def run_episode(
                     error_kind, error_msg, reason = err_kind, err_msg, err_kind
                     break
 
-                exec_resp = None
-                exec_exc: Exception | None = None
-                for sim_attempt in range(max_infra_retries + 1):
-                    try:
-                        exec_resp = await client.post(
-                            f"{sim_url.rstrip('/')}/sessions/{sid}/execute",
-                            json={"name": parsed_calls[0]["name"], "arguments": args},
-                            headers={"Accept": BINARY_EXECUTE_MEDIA_TYPE},
-                        )
-                        if (
-                            exec_resp.status_code in RETRYABLE_SIM_STATUS
-                            and sim_attempt < max_infra_retries
-                        ):
-                            await asyncio.sleep(_retry_delay_s(sim_attempt))
-                            continue
-                        exec_resp.raise_for_status()
-                        break
-                    except (httpx.HTTPError, OSError) as exc:
-                        exec_exc = exc
-                        exec_resp = None
-                        if sim_attempt < max_infra_retries:
-                            await asyncio.sleep(_retry_delay_s(sim_attempt))
-                if exec_resp is None:
-                    assert exec_exc is not None
-                    raise exec_exc
+                # Never retry non-idempotent /execute mid-episode (matches RLinf):
+                # any failure aborts cleanly as InfraEpisodeError so --resume retries.
+                try:
+                    exec_resp = await client.post(
+                        f"{sim_url.rstrip('/')}/sessions/{sid}/execute",
+                        json={"name": parsed_calls[0]["name"], "arguments": args},
+                        headers={"Accept": BINARY_EXECUTE_MEDIA_TYPE},
+                    )
+                    exec_resp.raise_for_status()
+                    if BINARY_EXECUTE_MEDIA_TYPE in exec_resp.headers.get(
+                        "content-type", ""
+                    ):
+                        executed, images = unpack_execute_response(exec_resp.content)
+                    else:
+                        executed = exec_resp.json()
+                        images = [
+                            base64.b64decode(b64)
+                            for b64 in executed.get("images_b64") or ()
+                        ]
+                except (httpx.HTTPError, OSError, ValueError) as exc:
+                    raise InfraEpisodeError(
+                        f"Tool {parsed_calls[0]['name']} transport error on {sim_url}: {exc}",
+                        kind="tool_transport",
+                    ) from exc
 
-                if BINARY_EXECUTE_MEDIA_TYPE in exec_resp.headers.get(
-                    "content-type", ""
-                ):
-                    executed, images = unpack_execute_response(exec_resp.content)
-                else:
-                    executed = exec_resp.json()
-                    images = []
+                if executed.get("infrastructure_error"):
+                    raise InfraEpisodeError(
+                        str(executed["infrastructure_error"]),
+                        kind="tool_transport",
+                    )
+
                 conv.append_tool_result(
                     tool_name=parsed_calls[0]["name"],
                     tool_call_id=parsed_calls[0]["id"],
@@ -810,10 +972,6 @@ async def run_episode(
                 success = bool(executed["success"])
                 truncated = bool(executed["truncated"])
                 done = bool(executed["done"])
-                if executed.get("infrastructure_error"):
-                    error_kind, reason = "tool_transport", "infrastructure_error"
-                    error_msg = str(executed["infrastructure_error"])
-                    break
             else:
                 if not done and turns >= max_turns:
                     reason = "request_limit"
@@ -832,6 +990,13 @@ async def run_episode(
         if owns_client:
             await client.aclose()
 
+    if turns == 0:
+        raise InfraEpisodeError(
+            f"Episode {episode_key or sid} ended with 0 sampled turns ({reason})",
+            kind="env_setup",
+        )
+
+    chains = conv.export_chains()
     outcome = {
         "episode_key": episode_key,
         "query_id": query_id,
@@ -842,6 +1007,7 @@ async def run_episode(
         "success": success,
         "truncated": truncated,
         "turns": turns,
+        "num_chains": len(chains),
         "termination_reason": "success" if success else reason,
         "error_kind": error_kind,
         "error": error_msg,
@@ -855,10 +1021,18 @@ async def run_episode(
             rollout_config = {
                 "max_turns": max_turns,
                 "max_tokens": max_tokens,
+                "context_window": context_window,
+                "max_episode_steps": max_episode_steps,
                 "temperature": temperature,
                 "top_p": top_p,
                 "top_k": top_k if resolved_provider == "sglang" else None,
                 "thinking": thinking,
+                "reasoning_effort": reasoning_effort,
+                "compaction_tokenizer": (
+                    str(token_counter.tokenizer_path)
+                    if token_counter is not None
+                    else None
+                ),
                 "image_size": image_size,
                 "max_actions_per_call": max_actions_per_call,
                 "include_jaw_mm": include_jaw_mm,
@@ -867,6 +1041,7 @@ async def run_episode(
                         "strategy": compaction.strategy,
                         "max_messages": compaction.max_messages,
                         "max_tokens": compaction.max_tokens,
+                        "context_window": compaction.context_window,
                         "keep_messages": compaction.keep_messages,
                         "keep_recent_images": compaction.keep_recent_images,
                         "keep_recent_thinking": compaction.keep_recent_thinking,
@@ -892,7 +1067,7 @@ async def run_episode(
         else:
             _atomic_write_json(output_dir / "outcome.json", outcome)
 
-    return outcome
+    return outcome, active_model_url
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -950,18 +1125,30 @@ def _build_parser() -> argparse.ArgumentParser:
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Skip episodes already saved in output_dir/episodes/*/trajectory.json",
+        help="Skip episodes already saved in output_dir/episodes/*",
     )
     parser.add_argument(
         "--save-trajectory",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Save full message trajectories + PNGs per episode for SFT export",
+        help="Save full message trajectories + chain snapshots + PNGs per episode for SFT",
     )
     parser.add_argument("--pass-offset", type=int, default=0)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--max-turns", type=int, default=50)
     parser.add_argument("--max-tokens", type=int, default=16384)
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=65536,
+        help="Hard context limit matching RLinf runner.seq_length (default: 65536)",
+    )
+    parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=10000,
+        help="Simulator step limit passed to /sessions/open (default: 10000)",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
@@ -970,6 +1157,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable reasoning/thinking mode (default: true)",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("xhigh", "medium", "low"),
+        default=None,
+        help="Optional reasoning_effort override for Qwen3.8 SGLang (default: model default)",
     )
     parser.add_argument(
         "--image-size",
@@ -994,7 +1187,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--compaction-max-tokens",
         type=int,
         default=None,
-        help="Explicit token trigger for history compaction (default: 48000 for dynamic)",
+        help="Token trigger for history compaction (default: 48000 for dynamic, aligned with RLinf)",
+    )
+    parser.add_argument("--keep-messages", type=int, default=10)
+    parser.add_argument("--keep-recent-images", type=int, default=4)
+    parser.add_argument("--keep-recent-thinking", type=int, default=4)
+    parser.add_argument(
+        "--preserve-opening-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Preserve step-0 opening images during dynamic compaction (default: true)",
+    )
+    parser.add_argument(
+        "--compaction-tokenizer",
+        type=Path,
+        default=None,
+        help="Optional HF tokenizer dir (e.g. Qwen3.5-4B) for exact Qwen token compaction counting",
     )
     parser.add_argument("--request-timeout-s", type=float, default=900.0)
     parser.add_argument("--max-llm-retries", type=int, default=8)
@@ -1039,20 +1247,35 @@ def main() -> None:
     if args.context_management == "dynamic":
         compaction_max_messages = None
         if compaction_max_tokens is None:
-            compaction_max_tokens = 44000
+            compaction_max_tokens = 48000
     compaction = CompactionConfig(
         strategy=args.context_management,
         max_messages=compaction_max_messages,
+        keep_messages=args.keep_messages,
+        context_window=args.context_window,
         max_tokens=compaction_max_tokens,
+        keep_recent_images=args.keep_recent_images,
+        keep_recent_thinking=args.keep_recent_thinking,
+        preserve_opening_images=args.preserve_opening_images,
+    )
+
+    token_counter = (
+        CompactionTokenCounter(args.compaction_tokenizer)
+        if args.compaction_tokenizer is not None
+        else None
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    completed = _load_completed_episodes(args.output_dir) if args.resume else {}
+    completed = (
+        _load_completed_episodes(args.output_dir, save_trajectory=args.save_trajectory)
+        if args.resume
+        else {}
+    )
     pending = [item for item in schedule if item["episode_key"] not in completed]
 
     logger.info(
         "Rollout starting: model=%s provider=%s endpoints=%d sim=%s concurrency=%d "
-        "scheduled=%d resumed=%d pending=%d shard=%d/%d",
+        "scheduled=%d resumed=%d pending=%d shard=%d/%d compaction=%s(max_tok=%s,ctx=%d,tok_counter=%s)",
         args.model_name,
         resolved_provider,
         len(model_urls),
@@ -1063,6 +1286,10 @@ def main() -> None:
         len(pending),
         shard_idx,
         num_shards,
+        compaction.strategy,
+        compaction.token_trigger,
+        args.context_window,
+        bool(token_counter),
     )
 
     pool = EndpointPool(model_urls)
@@ -1101,19 +1328,24 @@ def main() -> None:
                 ep_dir = args.output_dir / "episodes" / ep_key
                 async with sem:
                     chosen_url = pool.acquire()
+                    active_url = chosen_url
                     try:
-                        outcome = await run_episode(
+                        outcome, active_url = await run_episode(
                             model_url=chosen_url,
                             model_name=args.model_name,
                             sim_url=args.sim_url,
                             task=item["task"],
                             max_turns=args.max_turns,
                             max_tokens=args.max_tokens,
+                            context_window=args.context_window,
+                            max_episode_steps=args.max_episode_steps,
                             temperature=args.temperature,
                             top_p=args.top_p,
                             top_k=args.top_k,
                             thinking=args.thinking,
+                            reasoning_effort=args.reasoning_effort,
                             compaction=compaction,
+                            token_counter=token_counter,
                             image_size=args.image_size,
                             max_actions_per_call=args.max_actions_per_call,
                             include_jaw_mm=args.include_jaw_mm,
@@ -1136,8 +1368,9 @@ def main() -> None:
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                             "episode_key": ep_key,
                             "query_id": item["query_id"],
-                            "endpoint": chosen_url,
+                            "endpoint": active_url,
                             "error_type": type(exc).__name__,
+                            "error_kind": getattr(exc, "kind", None),
                             "error": str(exc),
                         }
                         async with write_lock:
@@ -1152,7 +1385,7 @@ def main() -> None:
                         )
                         return None
                     finally:
-                        pool.release(chosen_url)
+                        pool.release(active_url)
 
                 manifest_rec = {
                     "episode_key": ep_key,
@@ -1161,10 +1394,16 @@ def main() -> None:
                     "environment": outcome["environment"],
                     "success": bool(outcome["success"]),
                     "turns": int(outcome["turns"]),
+                    "num_chains": int(outcome.get("num_chains", 1)),
+                    "compaction_count": int(outcome.get("compaction_count", 0)),
                     "termination_reason": outcome["termination_reason"],
                     "error_kind": outcome["error_kind"],
                     "elapsed_s": outcome["elapsed_s"],
-                    "trajectory_path": f"episodes/{ep_key}/trajectory.json",
+                    "trajectory_path": (
+                        f"episodes/{ep_key}/trajectory.json"
+                        if args.save_trajectory
+                        else None
+                    ),
                 }
                 async with write_lock:
                     with manifest_path.open("a", encoding="utf-8") as fh:

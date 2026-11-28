@@ -354,11 +354,18 @@ def coordinate_definition(declaration: Tool) -> Tool:
 def validate_relations(name: str, arguments: dict[str, Any]) -> None:
     """Check value-dependent constraints that JSON Schema cannot express."""
     box = arguments.get("box")
-    if box is not None and (box[0] >= box[2] or box[1] >= box[3]):
-        raise ValueError("box must have row_min < row_max and col_min < col_max")
+    if box is not None:
+        if len(box) < 4:
+            raise ValueError("box must have 4 elements [row_min, col_min, row_max, col_max]")
+        if box[0] >= box[2] or box[1] >= box[3]:
+            raise ValueError("box must have row_min < row_max and col_min < col_max")
+    z_key = "z_range_cm" if "z_range_cm" in arguments else "z_range_m"
     z = arguments.get("z_range_m", arguments.get("z_range_cm"))
-    if z is not None and z[0] > z[1]:
-        raise ValueError("z_range_m must be [low,high] with low <= high")
+    if z is not None:
+        if len(z) < 2:
+            raise ValueError(f"{z_key} must have 2 elements [low, high]")
+        if z[0] > z[1]:
+            raise ValueError(f"{z_key} must be [low,high] with low <= high")
 
 
 def argument_hint(name: str, environment: str = "libero") -> str:
@@ -384,6 +391,6 @@ def argument_hint(name: str, environment: str = "libero") -> str:
         "back_project": "Supply exactly one pixel, box or mask_id; pixel/box must match the displayed camera and frame.",
         "move_to": "Supply xyz, orientation_rpy, or both as three finite numbers.",
         "move_base": "Supply bounded local velocities vx/vy/yaw_rate and duration_s within the declared limits.",
-        "move_lift": "Supply delta_m within +/-0.25 and duration_s within 0.1..5.",
+        "move_lift": "Supply delta_cm within +/-25 and duration_s within 0.1..5.",
         "execute_actions": "Supply a non-empty actions list within K; each item must be move_to with a target or set_gripper with opening 0..1, and optional observe must be none, all, or a declared camera.",
     }.get(name, "Follow the declared required fields and value ranges.")
