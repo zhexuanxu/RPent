@@ -70,6 +70,14 @@ simulators:
   #     VK_ICD_FILENAMES: /etc/vulkan/icd.d/nvidia_icd.json
   #     RPENT_ISAAC_KIT_ARGS: --/rtx/verifyDriverVersion/enabled=false --/ngx/enabled=false --/rtx/post/aa/op=0 --/rtx-transient/dlssg/enabled=false
 
+  # maniskill:
+  #   python: /path/to/envs/maniskill/bin/python
+  #   port: 28567
+  #   gpus: [4, 5, 6, 7]
+  #   workers: 8
+  #   env:
+  #     MS_ASSET_DIR: /path/to/assets/maniskill
+
   # robolab:
   #   python: /path/to/envs/robolab/bin/python
   #   port: 28564

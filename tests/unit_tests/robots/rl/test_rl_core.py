@@ -96,7 +96,8 @@ def test_geometry_backproject_and_png():
 
 
 @pytest.mark.parametrize(
-    "env", ["libero", "robotwin", "robocasa", "robodojo", "metaworld", "robolab"]
+    "env",
+    ["libero", "robotwin", "robocasa", "robodojo", "metaworld", "robolab", "maniskill"],
 )
 def test_prompts_all_envs(env: str):
     sys_p, usr_m = render_prompts(env, reasoning=True, max_actions_per_call=3)
@@ -442,7 +443,10 @@ def test_harness_v2_f1_f2_f3_f5_toolkit_across_all_6_envs(monkeypatch):
 
             def _display_shape(self, native_shape: tuple[int, int]) -> tuple[int, int]:
                 if env_name == "robolab":
-                    if self.display_size is None or max(native_shape) <= self.display_size:
+                    if (
+                        self.display_size is None
+                        or max(native_shape) <= self.display_size
+                    ):
                         return native_shape
                     h, w = native_shape
                     scale = self.display_size / max(native_shape)
@@ -547,7 +551,9 @@ def test_harness_v2_f1_f2_f3_f5_toolkit_across_all_6_envs(monkeypatch):
                     }
                 )
 
-        monkeypatch.setattr("robots.rl.toolkit.primitive_owner", lambda _: _FakePrimitives)
+        monkeypatch.setattr(
+            "robots.rl.toolkit.primitive_owner", lambda _: _FakePrimitives
+        )
 
         # 1) Default include_jaw_mm=False and image_size=None (F2 + F3 off + F5 opening)
         tk_off = RLToolkit(
@@ -612,9 +618,9 @@ def test_harness_v2_f1_f2_f3_f5_toolkit_across_all_6_envs(monkeypatch):
         assert res_none.data["results"][0]["position_error_cm"] == pytest.approx(0.12)
         serialized = json.dumps(res_none.data, separators=(",", ":"))
         limit = 800 if is_dual else 700
-        assert (
-            len(serialized) < limit
-        ), f"{env_name} payload too large ({len(serialized)}): {serialized}"
+        assert len(serialized) < limit, (
+            f"{env_name} payload too large ({len(serialized)}): {serialized}"
+        )
 
         # execute_actions with observe=<single_cam> returns latest step image
         target_cam = cams[-1]
@@ -624,7 +630,9 @@ def test_harness_v2_f1_f2_f3_f5_toolkit_across_all_6_envs(monkeypatch):
         )
         assert len(res_obs.images) == 1
         assert res_obs.data["observation"]["camera"] == target_cam
-        assert res_obs.data["observation"]["step"] == res_obs.data["final_state"]["step"]
+        assert (
+            res_obs.data["observation"]["step"] == res_obs.data["final_state"]["step"]
+        )
         assert res_obs.data["observation"]["images"] == [
             {"camera": target_cam, "size": list(expected_hw)}
         ]
@@ -994,9 +1002,7 @@ def test_rollout_atomic_save_retry_and_sft_export(tmp_path):
 
     async def _run():
         ep_dir = tmp_path / "episodes" / "libero-t0-s0__r0"
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(_handler)
-        ) as client:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
             return await run_episode(
                 model_url="http://mock/v1",
                 model_name="deepseek-v4.1-flash",
@@ -1033,9 +1039,7 @@ def test_rollout_atomic_save_retry_and_sft_export(tmp_path):
     assert drop is None and ms_sample is not None
     assert isinstance(ms_sample["tools"], str)
     assert len(ms_sample["images"]) == 2
-    assert (
-        sum(m["content"].count("<image>") for m in ms_sample["messages"]) == 2
-    )
+    assert sum(m["content"].count("<image>") for m in ms_sample["messages"]) == 2
     # Trailing tool_response after final execute_actions trimmed cleanly
     assert ms_sample["messages"][-1]["role"] == "tool_call"
     assert ms_sample["messages"][2] == {

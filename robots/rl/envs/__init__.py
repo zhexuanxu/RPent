@@ -19,6 +19,10 @@ from __future__ import annotations
 
 def primitive_owner(environment: str):
     """Return the primitive adapter class for ``environment``."""
+    if environment == "maniskill":
+        from robots.rl.envs.maniskill import ManiSkillRLPrimitives
+
+        return ManiSkillRLPrimitives
     if environment == "metaworld":
         from robots.rl.envs.metaworld import MetaWorldRLPrimitives
 

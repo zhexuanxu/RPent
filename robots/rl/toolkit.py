@@ -359,7 +359,7 @@ def system_prompt(variables: Mapping[str, object] | None = None) -> str:
         )
     limit = variables.get("max_actions_per_call", 3)
     action_lines = [
-        f"Action interface: execute_actions takes one to {limit} physical items in order, including single-item lists, plus an optional observe parameter (\"none\", \"all\", or one declared camera name; default \"none\").",
+        f'Action interface: execute_actions takes one to {limit} physical items in order, including single-item lists, plus an optional observe parameter ("none", "all", or one declared camera name; default "none").',
         "Read each measured result and final_state. A partial result, error or terminal stops the remaining items.",
         "The coordinates block is provided at episode start and whenever frame_version changes.",
     ]
@@ -405,15 +405,20 @@ def episode_tools(
 ) -> list[Tool]:
     """Build the centimetre-normalized tool declarations for ``environment``."""
     owner = RecordedPerception if perception is None else perception
-    batch_type = {
-        "libero": ActionBatch,
-        "metaworld": PositionActionBatch,
-        "robocasa": MobileBatch,
-        "robotwin": DualArmBatch,
-        "robodojo": DualArmBatch,
-        "robolab": ActionBatch,
-    }[environment]
-    batch = batch_type(toolkit).execute_actions
+    profile = getattr(primitive_owner(environment), "tool_profile", None)
+    if profile is not None:
+        batch, camera_groups = profile(toolkit, perception)
+    else:
+        batch_type = {
+            "libero": ActionBatch,
+            "metaworld": PositionActionBatch,
+            "robocasa": MobileBatch,
+            "robotwin": DualArmBatch,
+            "robodojo": DualArmBatch,
+            "robolab": ActionBatch,
+        }[environment]
+        batch = batch_type(toolkit).execute_actions
+        camera_groups = (CAMERAS[environment],) * 3
     schema = batch.input_schema
     schema["properties"]["actions"]["maxItems"] = max_actions
     batch = replace(
@@ -421,11 +426,13 @@ def episode_tools(
         _input_schema=schema,
         description=batch.description.replace("1..K", f"1..{max_actions}"),
     )
+    perception_tools = zip(
+        (owner.view_env, owner.segment, owner.back_project), camera_groups, strict=True
+    )
+    declarations = [(decl, cameras) for decl, cameras in perception_tools if cameras]
     return [
-        model_tool(
-            strict_tool(coordinate_definition(decl), cameras=CAMERAS[environment])
-        )
-        for decl in (owner.view_env, owner.segment, owner.back_project, batch)
+        model_tool(strict_tool(coordinate_definition(decl), cameras=cameras))
+        for decl, cameras in (*declarations, (batch, camera_groups[0]))
     ]
 
 
@@ -496,7 +503,7 @@ class RLToolkit(Toolkit):
         if resolved_image_size is not None and (
             environment == "robolab"
             or (
-                environment in {"libero", "robocasa", "metaworld"}
+                environment in {"libero", "robocasa", "metaworld", "maniskill"}
                 and resolved_image_size != NATIVE_SIZE
             )
         ):
@@ -553,7 +560,10 @@ class RLToolkit(Toolkit):
                 if isinstance(jaw, Mapping):
                     for arm, value in jaw.items():
                         if isinstance(state.get(arm), Mapping):
-                            state[arm] = {**state[arm], "jaw_mm": round(float(value), 1)}
+                            state[arm] = {
+                                **state[arm],
+                                "jaw_mm": round(float(value), 1),
+                            }
                 elif jaw is not None:
                     state["jaw_mm"] = round(float(jaw), 1)
                     state.pop("finger_gap_m", None)
@@ -719,8 +729,11 @@ class RLToolkit(Toolkit):
         if self.infrastructure_error is not None:
             return {"status": "error", "reason": "infrastructure_error"}
         if self._primitives.ended:
-            success = self.solved()
-            return {"status": "completed", "success": success, "truncated": not success}
+            return {
+                "status": "completed",
+                "success": self.solved(),
+                "truncated": self.truncated,
+            }
         return None
 
     def close(self) -> None:

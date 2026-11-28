@@ -305,6 +305,7 @@ include = ["rpent*", "robots", "robots.*", "toolkits", "toolkits.*"]
 exclude = ["tests*", "docs*", "examples*", "docker*"]
 
 [tool.setuptools.package-data]
+"robots.rl" = ["prompts/*.md", "envs/maniskill_tasks.json"]
 "robots.robodojo" = ["guides/*.md"]
 "rpent.dashboard" = ["*.html", "static/*.css", "static/*.js"]
 "robots.yam" = ["config/*.yaml", "config/*.json", "guides/*.md"]

@@ -385,13 +385,6 @@ class RoboLabRLPrimitives(RecordedPerception):
             }
         )
 
-    def _display_shape(self, native_shape: tuple[int, int]) -> tuple[int, int]:
-        if self.display_size is None or max(native_shape) <= self.display_size:
-            return native_shape
-        height, width = native_shape
-        scale = self.display_size / max(native_shape)
-        return max(1, round(height * scale)), max(1, round(width * scale))
-
     def capture(self, camera: str) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         """Read a named RoboLab camera at the acknowledged native step."""
         if camera not in self.cameras:

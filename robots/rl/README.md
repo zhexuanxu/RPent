@@ -1,6 +1,6 @@
 # RPent Unified RL Simulator Layer (`robots/rl`)
 
-`robots/rl` provides a compact, uniform tool-calling interface (Harness v2), warm HTTP simulator pools, and standalone rollout/evaluation harness across all six supported manipulation simulators (`libero`, `robotwin`, `robocasa`, `robodojo`, `metaworld`, and `robolab`).
+`robots/rl` provides a compact, uniform tool-calling interface (Harness v2), warm HTTP simulator pools, and standalone rollout/evaluation harness across all supported manipulation simulators (`libero`, `robotwin`, `robocasa`, `robodojo`, `metaworld`, `maniskill`, and `robolab`).
 
 ## Architecture
 
@@ -15,6 +15,7 @@ robots/rl/server.py  (FastAPI + SimPoolManager / SimPoolRouter over Unix-socket 
    │     ├── libero.py           (LocalLiberoEnv + LiberoRLPrimitives)
    │     ├── robotwin.py         (LocalRoboTwinEnv + RoboTwinRLPrimitives)
    │     ├── metaworld.py        (LocalMetaWorldEnv + MetaWorldRLPrimitives)
+   │     ├── maniskill.py        (LocalManiSkillEnv, ManiSkillRLPrimitives)
    │     ├── robocasa.py         (RoboCasaRLPrimitives)
    │     ├── robodojo.py         (RoboDojoRLPrimitives)
    │     └── robolab.py          (RoboLabRLPrimitives)
@@ -111,6 +112,23 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 ```
 
 Open a session with an MT50 task name (e.g. `pick-place-v3`) and a native task index `0..49` in `seed`. The fixed-wrist Sawyer enforces a strict 4-DoF `move_to` schema (`xyz`-only, rejecting `orientation_rpy`) plus `set_gripper`, reports calibrated live `pose.orientation_rpy`, provides `corner2` and `gripperPOV` views, and clamps `max_episode_steps` to MetaWorld's native 500-step horizon.
+
+#### ManiSkill
+
+Install the native ManiSkill worker on Linux with CUDA and Vulkan:
+
+```bash
+python -m pip install -r requirements/rl-maniskill.txt
+```
+
+Set `MS_ASSET_DIR` to the installed ManiSkill assets and start the shared SAM3 service with its checkpoint. The worker uses this service for the `segment` tool. Enable the `maniskill` pool in `tools/rl/sim_services.example.yaml`, or start a single worker:
+
+```bash
+python -m robots.rl.server serve --env maniskill --workers 1 --gpus 0 \
+  --port 28567 --sam3-endpoint http://127.0.0.1:28510
+```
+
+The 25 supported RGB-D tasks are listed in [the task catalog](envs/maniskill_tasks.json).
 
 #### RoboLab DROID
 

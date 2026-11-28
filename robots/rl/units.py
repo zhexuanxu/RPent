@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 EPISODE_CONTRACT_VERSION = 3
 CAMERAS: dict[str, tuple[str, ...]] = {
     "libero": ("agentview", "wrist"),
+    "maniskill": ("base_camera",),
     "metaworld": ("corner2", "gripperPOV"),
     "robocasa": ("agentview", "agentview_right", "wrist"),
     "robotwin": ("head", "left_wrist", "right_wrist"),
@@ -39,6 +40,7 @@ CAMERAS: dict[str, tuple[str, ...]] = {
 }
 DEFAULT_IMAGE_SIZE: dict[str, int | None] = {
     "libero": 512,
+    "maniskill": 512,
     "robocasa": 512,
     "metaworld": 512,
     "robolab": 768,  # 1280x720 -> 768x432 (exact 16:9 between 1024x576 and 512x288)
@@ -50,6 +52,7 @@ DEFAULT_IMAGE_SIZE: dict[str, int | None] = {
 def default_image_size(environment: str) -> int | None:
     """Return the default VLM display resolution for ``environment``."""
     return DEFAULT_IMAGE_SIZE.get(environment, 512)
+
 
 _LENGTH_FIELDS = frozenset({"xyz", "world_xyz", "tcp_xyz", "base_xyz", "vx", "vy"})
 _LINEAR_BOUNDS = frozenset(
@@ -363,6 +366,8 @@ def validate_relations(name: str, arguments: dict[str, Any]) -> None:
 
 def argument_hint(name: str, environment: str = "libero") -> str:
     """Short actionable model feedback on invalid tool arguments."""
+    if environment == "maniskill" and name == "execute_actions":
+        return "Use the declared actions for this robot. Set observe to none, all, or a declared camera."
     if environment == "metaworld" and name in {
         "execute_actions",
         "move_to",

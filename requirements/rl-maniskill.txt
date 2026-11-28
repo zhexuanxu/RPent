@@ -1,0 +1,5 @@
+-e .
+mani_skill==3.0.0b22
+svgpathtools==1.8.0
+opencv-python
+torch

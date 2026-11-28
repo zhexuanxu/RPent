@@ -261,9 +261,11 @@ class RecordedPerception:
         }
 
     def _display_shape(self, native_shape: tuple[int, int]) -> tuple[int, int]:
-        if self.display_size is None:
+        if self.display_size is None or max(native_shape) <= self.display_size:
             return native_shape
-        return self.display_size, self.display_size
+        height, width = native_shape
+        scale = self.display_size / max(native_shape)
+        return max(1, round(height * scale)), max(1, round(width * scale))
 
     def _query_view(
         self, camera: str | None, step: int | None

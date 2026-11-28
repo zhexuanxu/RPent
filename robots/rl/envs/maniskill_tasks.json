@@ -1,0 +1,29 @@
+{
+  "tasks": {
+    "DrawSVG-v1": "Trace the outline on the canvas.",
+    "DrawTriangle-v1": "Trace the triangle on the canvas.",
+    "FMBAssembly1Easy-v1": "Assemble the bridge on the board.",
+    "InsertFlower-v1": "Insert the flower into the vase.",
+    "LiftPegUpright-v1": "Stand the peg upright.",
+    "PegInsertionSide-v1": "Insert the peg into the side hole.",
+    "PickCube-v1": "Move the cube to the target.",
+    "PickCubeSO100-v1": "Move the cube to the target.",
+    "PickCubeWidowXAI-v1": "Move the cube to the target.",
+    "PickSingleYCB-v1": "Move the object to the target.",
+    "PlaceSphere-v1": "Place the sphere in the bin.",
+    "PlugCharger-v1": "Plug the charger into the outlet.",
+    "PokeCube-v1": "Use the peg to push the cube to the target.",
+    "PullCube-v1": "Pull the cube to the target.",
+    "PullCubeTool-v1": "Use the tool to pull the cube to the target.",
+    "PushCube-v1": "Push the cube to the target.",
+    "PushT-v1": "Push the T-shaped block onto its target.",
+    "RollBall-v1": "Roll the ball to the target.",
+    "SO100GraspCube-v1": "Grasp the cube.",
+    "StackCube-v1": "Stack the red cube on the green cube.",
+    "StackPyramid-v1": "Stack the cubes into a pyramid with the blue cube on top.",
+    "TwoRobotPickCube-v1": "Use both arms to move the cube to the target.",
+    "TwoRobotStackCube-v1": "Use both arms to stack the cubes.",
+    "UnitreeG1PlaceAppleInBowl-v1": "Place the apple in the bowl.",
+    "UnitreeG1TransportBox-v1": "Transport the box to the target."
+  }
+}
